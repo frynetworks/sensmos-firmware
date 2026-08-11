@@ -1,0 +1,20 @@
+{
+  "name": "sensmos-docker-node",
+  "version": "0.1.0",
+  "description": "Containerized Sensmos node — speaks the ESP32 firmware wire protocol without ESP32 hardware",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dry-run": "node src/index.js --dry-run",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

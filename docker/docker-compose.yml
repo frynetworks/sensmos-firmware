@@ -1,0 +1,43 @@
+services:
+  sensmos-node:
+    build: .
+    image: sensmos-node:latest
+    container_name: sensmos-node
+    restart: unless-stopped
+    environment:
+      # firmware = full node protocol, linked to the wallet below.
+      # ingest   = software-node POST /v1/ingest, no wallet binding.
+      SENSMOS_MODE: ${SENSMOS_MODE:-firmware}
+      SENSMOS_WALLET: ${SENSMOS_WALLET:-0x6403bdF454Ed25502378f231CB656C698Cb74d78}
+      SENSMOS_NODE_NAME: ${SENSMOS_NODE_NAME:-docker-node}
+      SENSMOS_FIRMWARE: ${SENSMOS_FIRMWARE:-0.1.0-docker}
+      SENSMOS_INTERVAL_SEC: ${SENSMOS_INTERVAL_SEC:-60}
+      SENSMOS_SIMULATE: ${SENSMOS_SIMULATE:-true}
+      SENSMOS_LOG_LEVEL: ${SENSMOS_LOG_LEVEL:-info}
+      SENSMOS_INGEST_KEY: ${SENSMOS_INGEST_KEY:-}
+      SENSMOS_LAT: ${SENSMOS_LAT:-}
+      SENSMOS_LON: ${SENSMOS_LON:-}
+    volumes:
+      # Identity lives here. Remove this volume and the node becomes a different node.
+      - sensmos-data:/data
+    ports:
+      - "${SENSMOS_HEALTH_BIND:-127.0.0.1:8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  sensmos-data:

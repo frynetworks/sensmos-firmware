@@ -1,0 +1,3 @@
+# Container files are consumed by Linux tooling regardless of where they are edited.
+* text=auto eol=lf
+*.png binary
