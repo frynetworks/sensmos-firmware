@@ -35,6 +35,33 @@ src/
   config.h               build-time settings
 ```
 
+## Ports in this fork
+
+This fork adds two alternative node implementations alongside the upstream ESP32 firmware:
+
+### `esp8266/` — ESP8266 firmware port
+
+PlatformIO port of the node firmware for ESP8266MOD boards (NodeMCU v2/v3, Wemos D1 mini, ESP-12). Key differences from the ESP32 target:
+
+- **No BLE** — provisioning happens through a WiFi **captive portal** instead of the Bluetooth setup flow.
+- **BearSSL TLS** (MFLN, 512-byte buffers) instead of mbedTLS; micro-ecc for secp256k1 signing — the wire protocol stays byte-compatible.
+- **~80 KB DRAM budget** — cooperative `*_tick()` scheduling from `loop()` (no FreeRTOS), `PSTR()`/PROGMEM string placement, LittleFS storage.
+- **Heap-exhaustion fixes included** — the registration-window OOM is resolved: the mDNS responder is retired (`MDNS.close()`) after registration or the 120 s onboarding discovery grace (`MDNS_RETIRE_MS`), and TLS peak usage is bounded via BearSSL `setBufferSizes(512, 512)` with a `HEAP_GATE_TLS` heap floor. WiFi association is forced to 802.11g PHY for robust STA/DHCP on 8266 silicon.
+
+Build & flash:
+
+```bash
+cd esp8266
+pio run                                   # build (NodeMCU v2 env)
+pio run -t upload --upload-port <COMx>    # flash
+```
+
+See [esp8266/README.md](esp8266/README.md) for the onboarding flow, serial tools, and known limits.
+
+### `docker/` — containerized node
+
+A Node.js implementation of the same wire protocol for running Sensmos nodes without ESP hardware. See [docker/README.md](docker/README.md).
+
 ## Part of the Sensmos project
 
 | | |
