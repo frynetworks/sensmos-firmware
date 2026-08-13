@@ -21,7 +21,7 @@ services:
       # Identity lives here. Remove this volume and the node becomes a different node.
       - sensmos-data:/data
     ports:
-      - "${SENSMOS_HEALTH_BIND:-127.0.0.1:8080}:8080"
+      - "${SENSMOS_HEALTH_BIND:-127.0.0.1:18080}:8080"
     healthcheck:
       test:
         - CMD
