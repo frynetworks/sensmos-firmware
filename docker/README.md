@@ -90,7 +90,7 @@ The container exposes `GET /healthz` on port 8080, which the Docker healthcheck 
 `GET /status` returns the same document formatted for reading:
 
 ```bash
-curl -s localhost:8080/status
+curl -s http://127.0.0.1:18080/status
 ```
 
 ```json
