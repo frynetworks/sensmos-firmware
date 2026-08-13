@@ -29,10 +29,10 @@ Confirm the node from outside the container:
 
 ```bash
 curl -s -H "X-App-Key: sensmos2025" \
-  https://api.sensmos.com/v1/nodes/by-owner/0x6403bdF454Ed25502378f231CB656C698Cb74d78
+  https://api.sensmos.com/v1/map/nodes
 ```
 
-Your `device_id` should be in the list with `"ws_online": true`.
+Your `device_id` should be in the `nodes` list with `"status": "online"`.
 
 ## How it works
 

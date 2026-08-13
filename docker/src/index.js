@@ -14,6 +14,7 @@ import { EntityStore } from './entities.js';
 import { SensmosWsClient } from './wsclient.js';
 import { register, checkClockSkew, buildRegistrationPayload } from './register.js';
 import { pushIngest, softDeviceId } from './ingest.js';
+import { pushLocationWs } from './geolocation.js';
 import { createHealthServer, NodeState } from './health.js';
 
 const timers = new Set();
@@ -184,6 +185,11 @@ async function runFirmwareMode(config, state, identity) {
     pingTimer = every(config.pingIntervalSec * 1000, () =>
       client.send({ type: 'ping', device_id: identity.deviceId, free: 0, largest: 0 }),
     );
+
+    // One tick later, like the firmware's deferred geoloc_push_ws(): first batch goes out first.
+    setImmediate(() => {
+      void pushLocationWs(client, config.lat !== undefined ? { manual: { lat: config.lat, lon: config.lon } } : undefined);
+    });
   });
 
   client.on('disconnected', () => {
