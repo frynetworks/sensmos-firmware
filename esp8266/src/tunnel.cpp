@@ -15,6 +15,9 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <mbedtls/base64.h>
+#ifdef MMU_IRAM_HEAP
+#include <umm_malloc/umm_heap_select.h>   // HeapSelectIram — drugi heap w IRAM
+#endif
 
 // ── Parametry (1:1 z ESP32 poza task/queue) ────────────────────
 #define TUN_CHUNK        1024          // bajtów na porcję (base64 → ~1420B JSON, mieści się w enc seal)
@@ -86,6 +89,10 @@ static void tun_free_all() {
 
 static bool tun_spin_up() {
     if (s_up) return true;
+    // ~3KB sesyjne do IRAM second heap — bulk base64/chunk, latency-tolerant.
+#ifdef MMU_IRAM_HEAP
+    HeapSelectIram ephemeral;
+#endif
     s_chunk = (uint8_t*)malloc(TUN_CHUNK);
     s_b64   = (uint8_t*)malloc(TUN_CHUNK * 2);
     if (!s_chunk || !s_b64) {

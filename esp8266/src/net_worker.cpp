@@ -18,6 +18,9 @@
 #include "traceroute.h"         // icmp_ping (port 8266) + trace
 #include <WiFi.h>
 #include <HTTPClient.h>
+#ifdef MMU_IRAM_HEAP
+#include <umm_malloc/umm_heap_select.h>   // HeapSelectIram — drugi heap w IRAM (MMU 16/48)
+#endif
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <math.h>
@@ -173,7 +176,15 @@ static void nw_run_fetch(NetJob& nj, NetResult& out) {
         snprintf_P(out.payload, sizeof(out.payload), PSTR("{\"http_error\":%d,\"status\":%d}"), code, code);
         return;
     }
-    char* buf = (char*)malloc(FETCH_BODY_LIMIT + 1);
+    char* buf;
+    {
+        // 4KB transientu do IRAM — najwiekszy nie-TLS skok; dostep bajtowy, ale bulk
+        // i rzadki (fetch joby), wiec handler non-32bit nie gra roli.
+#ifdef MMU_IRAM_HEAP
+        HeapSelectIram ephemeral;
+#endif
+        buf = (char*)malloc(FETCH_BODY_LIMIT + 1);
+    }
     if (!buf) {
         http.end();
         r.ok = false;
@@ -357,6 +368,12 @@ void net_worker_tick() {
 
 // ── API ───────────────────────────────────────────────────────
 bool net_worker_init() {
+    // Ringi (~7.2KB, rezydentne od bootu) do IRAM second heap: dostep to wylacznie
+    // struct-copy push/pop (wyrownane memcpy slowami), wiec kara non-32bit jest pomijalna,
+    // a DRAM odzyskuje najwiekszy stały blok heapu.
+#ifdef MMU_IRAM_HEAP
+    HeapSelectIram ephemeral;
+#endif
     s_hiQ  = new Ring<NetJob,    NET_JOBQ_DEPTH>();
     s_loQ  = new Ring<NetJob,    NET_JOBQ_DEPTH>();
     s_resQ = new Ring<NetResult, NET_RESQ_DEPTH>();
