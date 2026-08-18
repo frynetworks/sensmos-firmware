@@ -372,7 +372,24 @@ static const WsEntry WS_TABLE[] = {
 // ── Obsługa wiadomości ────────────────────────────────────────
 static void handle_message(const char* payload) {
     JsonDocument doc;
-    if (deserializeJson(doc, payload)) {
+    DeserializationError err;
+    if (!ws_enc_active()) {
+        // Pre-enc jedyne legalne ramki to identified/error, a identified urosła (2026-08-18)
+        // do ~3.7KB bogatych obiektów (45 encji × entity_id/category/name/unit). Pełny parse
+        // potrzebuje ~2× tyle heapu, ile mamy w najciaśniejszym punkcie sesji → NoMemory →
+        // "JSON parse error" i martwa sesja. Filtr trzyma TYLKO pola, które faktycznie
+        // czytamy (on_identified: enonce/server_time/entities[].entity_id; on_error: msg).
+        JsonDocument filter;
+        filter["type"] = true;
+        filter["msg"] = true;
+        filter["enonce"] = true;
+        filter["server_time"] = true;
+        filter["entities"][0]["entity_id"] = true;
+        err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+    } else {
+        err = deserializeJson(doc, payload);
+    }
+    if (err) {
         LOGW("ws", "JSON parse error");
         return;
     }
