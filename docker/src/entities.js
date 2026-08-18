@@ -59,9 +59,19 @@ export class EntityStore {
 
   /** pub.* readings: only names the backend calls native, so nothing is silently dropped. */
   buildPublic(nowSec) {
-    if (!this.simulate) return [];
-    this.phase += 1;
     const out = [];
+    // Real, measurable fact — always reported when the backend calls it native, so a node
+    // with no sensors still contributes a non-empty batch (entity_count 0 fix).
+    if (this.isNative('uptime_s')) {
+      out.push({
+        entity_id: 'pub.uptime_s',
+        value: String(this.uptimeSec()),
+        unit: 's',
+        last_updated: nowSec,
+      });
+    }
+    if (!this.simulate) return out;
+    this.phase += 1;
     for (const [name, spec] of Object.entries(SIMULATED)) {
       if (!this.isNative(name)) continue;
       out.push({

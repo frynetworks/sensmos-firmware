@@ -52,14 +52,20 @@ void data_sender_send_ping() {
 }
 
 // ── Podstawowe metryki noda → mon.* (telemetria, osobna ramka) ─
+// PLUS pub.*: te same trzy metryki są w katalogu natywnym BE (wifi_rssi/wifi_nets/uptime_s),
+// a node bez czujników miał entities[] puste w KAŻDYM batchu → BE zapisywał 0 encji
+// (entity_count 0 na mapie mimo acków). Publikacja pub.* daje niepusty batch z realnymi danymi.
 static void push_basics() {
     char val[32];
     snprintf_P(val, sizeof(val), PSTR("%d"),  WiFi.RSSI());
     entity_push("mon.wifi_rssi", val, "dBm");
+    entity_push("pub.wifi_rssi", val, "dBm");
     snprintf_P(val, sizeof(val), PSTR("%d"),  g_last_nets);
     entity_push("mon.wifi_nets", val, "");
+    entity_push("pub.wifi_nets", val, "");
     snprintf_P(val, sizeof(val), PSTR("%lu"), millis() / 1000);
     entity_push("mon.uptime_s",  val, "s");
+    entity_push("pub.uptime_s",  val, "s");
 }
 
 // ── WiFi scan (job na worze) + odświeżanie encji bazowych ─────

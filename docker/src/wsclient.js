@@ -152,7 +152,8 @@ export class SensmosWsClient extends EventEmitter {
         this.#onIdentified(doc);
         break;
       case 'batch_ack':
-        log.info('ws', 'batch acknowledged');
+        // The ack payload is the only place the backend says how much it actually kept.
+        log.info('ws', `batch acknowledged (${Number(doc.entities_saved) || 0} entities saved)`);
         this.emit('batch_ack', doc);
         break;
       case 'batch_error':

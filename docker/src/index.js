@@ -6,6 +6,7 @@
  * ingest mode:   the far simpler POST /v1/ingest software-node path, with no owner binding.
  */
 
+import os from 'node:os';
 import process from 'node:process';
 import { loadConfig } from './config.js';
 import { log, setLevel } from './logger.js';
@@ -182,8 +183,19 @@ async function runFirmwareMode(config, state, identity) {
     monTimer = every(config.monIntervalSec * 1000, () =>
       client.send(buildMonBatch({ config, identity, store })),
     );
+    // Same frame shape as data_sender_send_ping(): real memory numbers plus the worker
+    // saturation metrics (all zero here — the container runs no monitor jobs).
     pingTimer = every(config.pingIntervalSec * 1000, () =>
-      client.send({ type: 'ping', device_id: identity.deviceId, free: 0, largest: 0 }),
+      client.send({
+        type: 'ping',
+        device_id: identity.deviceId,
+        free: os.freemem(),
+        largest: os.freemem(),
+        q_lag: 0,
+        q_busy: 0,
+        q_depth: 0,
+        q_wait: 0,
+      }),
     );
 
     // One tick later, like the firmware's deferred geoloc_push_ws(): first batch goes out first.
@@ -196,6 +208,7 @@ async function runFirmwareMode(config, state, identity) {
     state.wsConnected = false;
     state.encrypted = false;
   });
+  client.on('batch_ack', (doc) => state.recordAck(doc));
   client.on('batch_error', (doc) => {
     state.lastError = `batch_error ${JSON.stringify(doc).slice(0, 160)}`;
   });

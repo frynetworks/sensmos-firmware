@@ -47,7 +47,20 @@ export class NodeState {
     this.batchesFailed = 0;
     this.lastBatchAt = null;
     this.lastError = null;
+    this.batchesAcked = 0;
+    this.entitiesSavedLast = null;
+    this.entitiesSavedTotal = 0;
+    this.lastAckAt = null;
     this.startedAt = Date.now();
+  }
+
+  /** Backend confirmed a batch; `entities_saved` says how many readings it kept. */
+  recordAck(doc = {}) {
+    const saved = Number(doc.entities_saved) || 0;
+    this.batchesAcked += 1;
+    this.entitiesSavedLast = saved;
+    this.entitiesSavedTotal += saved;
+    this.lastAckAt = Date.now();
   }
 
   snapshot() {
@@ -74,6 +87,10 @@ export class NodeState {
       encrypted: this.encrypted,
       batches_sent: this.batchesSent,
       batches_failed: this.batchesFailed,
+      batches_acked: this.batchesAcked,
+      entities_saved_last: this.entitiesSavedLast,
+      entities_saved_total: this.entitiesSavedTotal,
+      seconds_since_ack: this.lastAckAt ? Math.round((now - this.lastAckAt) / 1000) : null,
       seconds_since_batch: sinceBatchSec,
       uptime_s: Math.round((now - this.startedAt) / 1000),
       last_error: this.lastError,
