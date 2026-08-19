@@ -20,6 +20,7 @@ data peer-to-peer, and earn the GALU token. The network powers
 | Hardware | flashed and boot-verified on real ESP8266 (ESP-12 / FT232R, 4 MB flash) |
 | Boot QA | 2 consecutive boots, no exceptions / WDT resets, ~17 KB free heap in portal mode |
 | Over-the-air portal test | **not** run by the porting harness — see [Onboarding](#onboarding) |
+| Upstream sync | verified current with Galusz/sensmos-firmware:main — 0 commits behind (GitHub compare API, `ahead_by:0`) as of the commits already merged into this fork's history |
 
 ## Onboarding
 
@@ -96,7 +97,12 @@ src/
   esp8266_compat.h     ESP32→ESP8266 shims (RNG, MAC, heap, chip info)
   WiFi.h WebServer.h HTTPClient.h Preferences.h ESPmDNS.h Update.h mbedtls/
                        header shims so upstream modules compile unchanged
+  ws_tls.*             wolfSSL TLS PoC — gated behind SENSMOS_USE_TLS, see below
   …                    upstream modules (entity store, scripts, monitors, HTTP API, …)
+tools/
+  gate_heap.py          heap-gate serial harness — see Measured performance
+  patch_wolfssl_settings.py
+                        pre-build hook for the nodemcuv2_tls env (see TLS upgrade path)
 ```
 
 ## Known limitations
@@ -233,34 +239,76 @@ identity during the handshake, and optionally pin a hash of the backend's TLS ce
 for out-of-band checks. Cost: ~32–64 B. Adds server authentication with no TLS stack at all.
 Missing: record-layer protection and protocol negotiation.
 
-**Option 3 — wolfSSL (recommended if full TLS is required on ESP8266).**
-Purpose-built for constrained devices, with Espressif support and examples
-([wolfssl.com/espressif](https://www.wolfssl.com/espressif/),
-[github.com/wolfSSL/wolfssl/tree/master/IDE/Espressif](https://github.com/wolfSSL/wolfssl/tree/master/IDE/Espressif)):
+**Option 3 — wolfSSL — PoC built and measured; does not fit this firmware's budget.**
+A working proof-of-concept now exists (`ws_tls.cpp`/`ws_tls.h`, gated behind the
+`SENSMOS_USE_TLS` build flag, isolated to its own `nodemcuv2_tls` PlatformIO environment so the
+shipping `nodemcuv2` build carries zero TLS code — confirmed byte-identical RAM/Flash usage with
+and without the PoC files present). Findings, from an actual build against this firmware, not
+wolfSSL's published numbers:
+
+* **wolfSSL's `wolfssl/wolfssl` PlatformIO package (5.7.2) ships its own bundled
+  `user_settings.h`, tuned for ESP-IDF/ESP32.** `wolfssl/wolfcrypt/settings.h` auto-defines
+  `WOLFSSL_USER_SETTINGS` and quoted-`#include`s that bundled file itself — project-side `-D`
+  build flags cannot override a `#define` inside a header included *after* them. Worked around
+  with a PlatformIO `extra_scripts` pre-build hook (`tools/patch_wolfssl_settings.py`) that
+  overwrites the package's copy with an ESP8266-Arduino-appropriate config before every build.
+* **ESP8266 Arduino (NONOS SDK) has no BSD sockets layer.** wolfSSL's built-in socket I/O
+  (`wolfio.h`) assumes one exists for any target named `ESP8266`, and needs `socklen_t` /
+  `struct iovec` that don't exist here. Fixed with `WOLFSSL_USER_IO` + `WOLFSSL_NO_SOCK` and
+  custom transport callbacks (`wolfSSL_CTX_SetIORecv`/`SetIOSend`) wired directly to
+  `WiFiClient::read()`/`write()` — this part works cleanly.
+* **The library compiles.** After the above, plus `NO_CRYPT_TEST`/`NO_CRYPT_BENCHMARK` (wolfSSL's
+  own test/benchmark harnesses reference ESP-IDF-only `ESP_LOGE`/`sdkconfig.h` and don't apply
+  here) and satisfying TLS 1.3's real prerequisites (`HAVE_HKDF`, `WC_RSA_PSS`), every wolfSSL
+  source file builds without error against the ESP8266 Arduino toolchain.
+* **It does not link.** Even in a maximally trimmed configuration — `NO_SESSION_CACHE`, a single
+  ECC curve (`ECC_USER_CURVES` + `HAVE_ECC256` only), `RSA_LOW_MEM`, `NO_DH` (removes FFDHE
+  group tables — this firmware only wants ECDHE), single-threaded, small-stack — the final link
+  fails: `.bss` (and, before the above trims, `.rodata` too) overflows the ESP8266's 80 KB
+  `dram0_0_seg` region by **1,488 bytes**, on top of this firmware's existing ~56.7 KB static
+  baseline (69.3 % of 80 KB before wolfSSL is added at all — see Status table). Confirmed
+  reproducible across the final build. Symbol-table evidence
+  (`xtensa-lx106-elf-nm --size-sort` on the built `libwolfssl.a`) shows wolfSSL's own *direct*
+  global `.bss` footprint is trivial (~136 B total: RNG mutex flags and one 80 B scratch buffer)
+  — the overflow is the cumulative cost of linking wolfSSL's code and data into this image, not
+  one dominant static buffer, and swapping wolfSSL's big-number backend
+  (`WOLFSSL_SP_MATH_ALL`/`WOLFSSL_SP_SMALL` in place of the default fast-math) made no measurable
+  difference, ruling out RSA/ECC math tables as the cause.
+* Because the firmware never links, **no on-device runtime heap measurement (handshake spike,
+  steady-state) was obtainable** — the PoC's heap-instrumentation code (`ws_tls_run_poc_test()`,
+  logging `[tls-heap]` readings at init/CTX/connect/handshake/steady-state/cleanup) is in place
+  and ready to run the moment the image fits, but static memory pressure alone is the blocker
+  here, before any dynamic allocation is reached.
+
+**Conclusion: wolfSSL does not fit this port's ~25 KB total addressable budget as a drop-in TLS
+option, contradicting the earlier documentation-level estimate below this section — that estimate
+assumed IRAM-routing and buffer trimming would be sufficient; on-device, the shortfall is in
+static image size, ~1.5 KB past the hard 80 KB DRAM ceiling, before the runtime heap question
+even arises.** The two paths that could plausibly close a 1.5 KB gap — freeing static RAM
+elsewhere in the existing ~56.7 KB baseline, or moving more of wolfSSL's `.text` into the IRAM
+icache region (trading back some of the 16 KB icache this port already gave up for the second
+heap, see Optimizations above) — are real options for a follow-up, not evaluated here to keep
+this PoC's scope to "does it fit as built." Absent either, the hardware answer stands: **ESP32 /
+ESP32-C3** removes the constraint outright. wolfSSL's own published memory figures (referenced
+below) remain the right numbers to start from *if* an ESP32-class target is ever adopted; they
+are not achievable on this chip's 80 KB DRAM once this firmware's own footprint is accounted for.
+
+<details>
+<summary>wolfSSL's published numbers (context, not achieved here)</summary>
 
 * I/O buffers default to **128 B** (`RECORD_SIZE`) versus BearSSL's 16 KB RX default — the
-  single biggest memory difference between the stacks.
+  single biggest memory difference between the stacks, in principle.
 * Per-session RAM: **1–36 KB depending on configuration** (buffer sizes, key algorithm, math
   library) — configurable toward the low end when both endpoints are controlled, as here.
-* **TLS 1.3 works on ESP8266** (wolfSSL has demonstrated TLS 1.3 in 32 KB total RAM on an
-  Arduino Nano 33). Caveat: wolfSSL's ESP8266 testing targets the RTOS SDK; the Arduino core is
-  NONOS-based, which maintainers expect to work but which needs a proof-of-concept here.
-* `WOLFSSL_SMALL_STACK` cuts stack use from ~23–42 KB to ~2.1 KB — essential next to the
-  ESP8266's 4 KB continuation stack. Note it shifts that usage to the heap rather than
-  eliminating it.
-* Custom allocator hooks (`XMALLOC`/`XREALLOC`/`XFREE`) — wolfSSL's heap could be routed into
-  the IRAM second heap via `HeapSelectIram`, keeping DRAM for the application.
-* Restricting to a single suite (e.g. `TLS_AES_128_GCM_SHA256`) and enabling session resumption
-  (~100 B per cached session, per wolfSSL docs) minimizes both code size and reconnect cost.
-* Software-only crypto (no HW acceleration on ESP8266): wolfSSL's published 160 MHz figures are
-  ~1.2 ECDSA P-256 signs/sec — slow, but a handshake is rare in this workload (one per WS
-  session, cheaper still with resumption).
+* wolfSSL has demonstrated TLS 1.3 in 32 KB total RAM on an Arduino Nano 33 — a different chip
+  with more headroom than the ESP8266 has after this firmware's own static allocation.
+* `WOLFSSL_SMALL_STACK` (used in the PoC) cuts stack use from ~23–42 KB to ~2.1 KB, shifting that
+  usage to the heap rather than eliminating it — irrelevant to the `.bss`/static-image overflow
+  found here, which happens before any stack or heap accounting begins.
 * Licensing: **GPLv2 / commercial dual license** — GPLv2 is free and compatible with an
-  open-source deployment like this fork; commercial licensing exists if the project ever needs it.
-* Feasibility estimate: 128 B buffers + `SMALL_STACK` + single cipher + IRAM routing *could*
-  fit a TLS 1.3 session inside the measured ~25 KB total addressable heap. **This is a
-  documentation-level estimate from wolfSSL's published numbers, not an on-device measurement —
-  a proof-of-concept build is the required next step before committing to TLS on ESP8266.**
+  open-source deployment like this fork.
+
+</details>
 
 **Option 4 — BearSSL TLS on the WS path → requires ESP32-class hardware.**
 BearSSL (the Arduino core's built-in stack) needs ~28 KB per connection for a persistent

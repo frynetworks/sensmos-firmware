@@ -24,6 +24,7 @@
 #include "self_register.h"
 #include "geolocation.h"
 #include "tunnel.h"
+#include "ws_tls.h"
 #include "log.h"
 #include "config.h"
 #include <Preferences.h>
@@ -184,6 +185,9 @@ void setup() {
             }
             LOGI("boot", "ready — heap %uk free, blk %uk",
                  ESP.getFreeHeap() / 1024, ESP.getMaxFreeBlockSize() / 1024);
+#ifdef SENSMOS_USE_TLS
+            ws_tls_run_poc_test();   // one-shot wolfSSL heap measurement — nodemcuv2_tls env only
+#endif
             node_running = true;
             watchdog_start();  // nieaktywny jeśli node_confirmed=true w NVS
         } else {
