@@ -110,6 +110,183 @@ src/
 * Over-the-air portal interaction was verified structurally (routes, page size, DNS catch-all) and
   by compile + hardware boot; the browser flow itself is a manual test.
 
+## ESP8266 Hardware Specifications & Memory Budget
+
+A technical report on what the ESP8266 gives us, what this port achieved and measured, why the
+60 KB free-heap guideline exists and when it applies, and the upgrade path if TLS is required.
+
+### Hardware constraints
+
+* Total user DRAM: **~80 KB** (81,920 B) — versus ~520 KB SRAM on the upstream ESP32 target.
+* A bare WiFi sketch (SDK + WiFi stack, no application) leaves ~40–45 KB free.
+* This firmware's static allocation (`.bss` + `.data` + `.rodata`): **~57 KB (69.3 %)**.
+* What remains (~23 KB) covers the WiFi/lwIP runtime residents (~19 KB) plus every heap allocation.
+* The allocator is umm_malloc (first-fit): **fragmentation matters** — `MaxFreeBlockSize` is the
+  number that predicts allocation success, not total `FreeHeap`. The `[health]`/`[mem]` log lines
+  report both, plus `getHeapFragmentation()`.
+* No Bluetooth (unlike ESP32) — no BT/WiFi coexistence overhead.
+
+### Why the 60 KB free-heap guideline applies to ESP32, not ESP8266
+
+**On ESP32 (the upstream target), 60 KB free is the right rule.** With ~520 KB SRAM, a TLS
+WebSocket (`wss://`) whose handshake spikes ~28 KB (≈22 KB BearSSL/mbedTLS buffers + ~6 KB
+stack), and WiFi + Bluetooth coexistence reserving additional RAM, keeping 60 KB free ensures
+the TLS spike never crashes the node while still leaving ~460 KB for the application. It is a
+sound guideline in that context.
+
+**On ESP8266, the same number is not applicable — the conditions it protects against don't
+exist here:**
+
+* 60 KB free out of 80 KB total would leave 20 KB for SDK + WiFi + application static — which
+  alone consume ~57 KB. The number is unreachable by roughly a factor of three before the first
+  `malloc`.
+* This port runs **plaintext WS by design** (`WS_PLAINTEXT=1` in `config.h`) — the ~28 KB TLS
+  handshake spike that motivates the ESP32 rule never happens on the WS path.
+* The transport is not unprotected: every frame is already encrypted and authenticated at the
+  **application layer** (ECDH + HKDF + AES-128-GCM, `ws_enc.cpp` — see below).
+* No Bluetooth, single-purpose sensor workload — the overhead profile is fundamentally different.
+* Industry reference points for production-stable ESP8266 firmware without TLS on the main
+  connection: Tasmota runs at ~20–26 KB free, ESPHome targets >30 KB. This port's measured
+  **~25 KB total addressable** free memory is inside that production-safe range.
+
+**When 60 KB would become relevant here:** if full BearSSL TLS were mandated on the WS
+connection, its ~28 KB handshake exceeds everything this chip can free — at that point the
+hardware answer is an ESP32/ESP32-C3, and the software answer worth testing first is wolfSSL
+(see the TLS upgrade path below).
+
+### Measured performance (after optimization)
+
+Numbers from bounded serial captures (`tools/gate_heap.py`) on real hardware (ESP-12, 160 MHz),
+verified over 90–180 s windows with the node connected, encrypted, and acked by the backend:
+
+| Metric | Before optimization | After optimization |
+|---|---:|---:|
+| DRAM steady-state free | ~5,120 B | ~12,288 B |
+| DRAM max free block | ~4,096 B | ~11,264 B |
+| DRAM heap fragmentation | not instrumented | 7 % |
+| IRAM second heap free | 0 B | 12,520 B |
+| **Total addressable free** | **~5,120 B** | **~24,800 B** |
+| 180 s stability gate | PASS (floor 3000) | PASS (floor 6000, min 13,312) |
+| WDT / OOM / crash events | 0 | 0 |
+
+"Total addressable" = DRAM free + IRAM second heap. The IRAM heap requires 32-bit-aligned
+access (byte access works via the core's non32xfer handler, at a cost); the allocations routed
+there via `HeapSelectIram` are the net_worker job/result rings (~7.2 KB resident), the 4 KB
+HTTP-fetch transient, and the ~3 KB tunnel session buffers — bulk, alignment-friendly, and
+latency-tolerant.
+
+### Optimizations applied
+
+**Explicit in this port:**
+
+* IRAM second heap — `PIO_FRAMEWORK_ARDUINO_MMU_CACHE16_IRAM48_SECHEAP_SHARED` (+12.5 KB IRAM
+  heap; +7 KB steady DRAM from routing the buffers above)
+* LWIP2 low-memory variant (`TCP_MSS=536`)
+* MFLN 512 B buffers on the HTTPClient TLS shim (transient HTTPS fetches only)
+* Fixed-scratch JSON serialization + **field-filtered parsing** of pre-encryption frames
+  (the `identified` catalog reached 45 rich entity objects / 3,686 B — a full parse OOMs at the
+  tightest point of the session; the filter keeps only the fields the firmware reads)
+* `WEBSOCKETS_SAVE_RAM` (headers to flash, −476 B static) and `WEBSOCKETS_MAX_DATA_SIZE`
+  capped 15 KB → 4 KB (2 KB was tested and rejected: it is smaller than the `identified` frame)
+* 160 MHz CPU — no RAM-map change, but peak-memory windows (crypto/JSON/TLS fetches) close
+  twice as fast, reducing fragmentation pressure
+* `F()`/PROGMEM discipline — 262+ string literals in flash (on ESP8266 `.rodata` lives in DRAM)
+* Entity/batch buffers retuned (batch 10 vs ESP32's 16), stack-scoped crypto contexts (zero
+  resident heap for ECDH/AES-GCM), `WiFi.persistent(false)`, AP teardown after provisioning,
+  mDNS responder retired at runtime (documented OOM guard)
+
+**Framework defaults, verified active in this build:**
+
+* `-Os`, `-ffunction-sections`, `-fdata-sections`, `--gc-sections`, `-fno-exceptions`
+* `VTABLES_IN_FLASH`
+* Extra 4 K heap (cont-stack overlap)
+
+### Application-layer encryption (current state)
+
+The sensmos protocol encrypts **all** data before it reaches the WebSocket:
+
+* Key exchange: ECDH (secp256k1) — a per-session shared secret negotiated at connect time,
+  expanded via HKDF-SHA256 with both peers' nonces.
+* Payload protection: AES-128-GCM — authenticated encryption; every frame in both directions
+  carries a GCM tag and an anti-replay sequence number.
+* Implementation: `ws_enc.cpp` (micro-ecc + BearSSL primitives, stack-scoped contexts, zero
+  resident heap). The backend's public key is a compiled constant.
+
+So the payload is already encrypted and integrity-protected in transit, even over plaintext WS.
+What application-layer crypto does **not** provide, and TLS would add: **server certificate
+verification** (proving the node talks to the real sensmos backend rather than an impersonator
+at the DNS/routing layer) and **protocol downgrade protection**.
+
+### TLS upgrade path (if required)
+
+From lightest to heaviest:
+
+**Option 1 — current: plaintext WS + application-layer crypto (recommended on ESP8266).**
+Zero memory overhead beyond the measured budget; production-safe at ~25 KB total addressable.
+Missing: server certificate verification and downgrade protection. Appropriate while the WS
+endpoint is trusted via DNS/infrastructure security.
+
+**Option 2 — application-layer key pinning (lightest addition).**
+The ECDH infrastructure already pins the backend's identity key as a compiled constant; this
+option formalizes it — verify the server's session key material against the pinned backend
+identity during the handshake, and optionally pin a hash of the backend's TLS certificate key
+for out-of-band checks. Cost: ~32–64 B. Adds server authentication with no TLS stack at all.
+Missing: record-layer protection and protocol negotiation.
+
+**Option 3 — wolfSSL (recommended if full TLS is required on ESP8266).**
+Purpose-built for constrained devices, with Espressif support and examples
+([wolfssl.com/espressif](https://www.wolfssl.com/espressif/),
+[github.com/wolfSSL/wolfssl/tree/master/IDE/Espressif](https://github.com/wolfSSL/wolfssl/tree/master/IDE/Espressif)):
+
+* I/O buffers default to **128 B** (`RECORD_SIZE`) versus BearSSL's 16 KB RX default — the
+  single biggest memory difference between the stacks.
+* Per-session RAM: **1–36 KB depending on configuration** (buffer sizes, key algorithm, math
+  library) — configurable toward the low end when both endpoints are controlled, as here.
+* **TLS 1.3 works on ESP8266** (wolfSSL has demonstrated TLS 1.3 in 32 KB total RAM on an
+  Arduino Nano 33). Caveat: wolfSSL's ESP8266 testing targets the RTOS SDK; the Arduino core is
+  NONOS-based, which maintainers expect to work but which needs a proof-of-concept here.
+* `WOLFSSL_SMALL_STACK` cuts stack use from ~23–42 KB to ~2.1 KB — essential next to the
+  ESP8266's 4 KB continuation stack. Note it shifts that usage to the heap rather than
+  eliminating it.
+* Custom allocator hooks (`XMALLOC`/`XREALLOC`/`XFREE`) — wolfSSL's heap could be routed into
+  the IRAM second heap via `HeapSelectIram`, keeping DRAM for the application.
+* Restricting to a single suite (e.g. `TLS_AES_128_GCM_SHA256`) and enabling session resumption
+  (~100 B per cached session, per wolfSSL docs) minimizes both code size and reconnect cost.
+* Software-only crypto (no HW acceleration on ESP8266): wolfSSL's published 160 MHz figures are
+  ~1.2 ECDSA P-256 signs/sec — slow, but a handshake is rare in this workload (one per WS
+  session, cheaper still with resumption).
+* Licensing: **GPLv2 / commercial dual license** — GPLv2 is free and compatible with an
+  open-source deployment like this fork; commercial licensing exists if the project ever needs it.
+* Feasibility estimate: 128 B buffers + `SMALL_STACK` + single cipher + IRAM routing *could*
+  fit a TLS 1.3 session inside the measured ~25 KB total addressable heap. **This is a
+  documentation-level estimate from wolfSSL's published numbers, not an on-device measurement —
+  a proof-of-concept build is the required next step before committing to TLS on ESP8266.**
+
+**Option 4 — BearSSL TLS on the WS path → requires ESP32-class hardware.**
+BearSSL (the Arduino core's built-in stack) needs ~28 KB per connection for a persistent
+session (≈22 KB buffers + ~6 KB stack) — more than the ~25 KB this port can free in total.
+The MFLN 512 B trick this port already uses for HTTPS *fetches* (~9 KB, heap-gated) works
+because those connections are short-lived and deferrable; a persistent `wss://` session would
+hold the buffers forever and additionally depends on the server negotiating MFLN. If BearSSL
+TLS is mandated on the WS connection, the hardware answer is an ESP32 (520 KB) or ESP32-C3
+(400 KB).
+
+**Also considered:** Mbed TLS (~26 KB reported integration footprint on ESP8266 — same class
+as BearSSL, does not fit); axTLS (deprecated in ESP8266 Arduino core 2.5.0, fully removed in
+3.0.0 — do not use).
+
+### Hardware ceiling
+
+* ~80 KB DRAM − ~57 KB static − ~19 KB WiFi/lwIP residents ≈ **4–5 KB free unoptimized**.
+* With every software optimization applied: **~12 KB DRAM + ~12.5 KB IRAM ≈ ~25 KB total.**
+* 60 KB free DRAM is not achievable on this chip — it exceeds what remains after minimum static
+  allocation by ~37 KB. 60 KB combined (DRAM + IRAM) would still need ~35 KB more than exists
+  after all optimizations.
+* The path to substantially more memory is hardware: **ESP32 (~520 KB) or ESP32-C3 (~400 KB)**
+  removes the constraint entirely. The ESP8266 core also supports external SPI SRAM (23LC1024,
+  `PIO_FRAMEWORK_ARDUINO_MMU_EXTERNAL_128K`) at the cost of a hardware modification
+  (an extra chip on GPIO12–15).
+
 ## Upstream project
 
 | | |
