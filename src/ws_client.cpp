@@ -18,6 +18,10 @@
 #include "punch.h"
 #include "monitors.h"
 #include "tunnel.h"
+#include "lora_scan.h"
+#include "pairing.h"
+#include "ntp_time.h"   // okno świeżości dowodu przy tun_open
+#include "fw_digest.h"
 #include "data_sender.h"
 #include "ws_enc.h"
 #include "log.h"
@@ -101,7 +105,18 @@ static void send_identify() {
     doc["enc"]       = 1;             // wymagam szyfrowania kanału (ws_enc)
     doc["enonce"]    = enonce_hex;    // pół soli klucza sesji
     doc["firmware"]  = FW_VERSION;
-    if (tunnel_enabled()) doc["remote"] = 1;   // remote-access ON → BE omija ten node w doborze monitorów
+    if (pairing_has_key()) doc["remote"] = 1;   // sparowany → BE wie, że node może otworzyć tunel
+#if LORA_ENABLED
+    // Zdolność radiowa wykryta przy starcie (SX1262 faktycznie odpowiedział) — BE wysyła
+    // lora_cfg wyłącznie takim nodom, więc reszta floty nie dostaje ramek, których nie zrozumie.
+    if (lora_available()) {
+        doc["lora"] = 1;
+        // Nazwa WYKRYTEJ plytki, nie zbudowanej — chip (ESP32-S3 r2 @240MHz 8MB) wyglada
+        // identycznie dla XIAO i Helteca, wiec BE nie mial jak ich rozroznic i zgadywal
+        // target po rozmiarze flasha.
+        doc["board"] = lora_board_name();
+    }
+#endif
     // Dane plytki RAZ na polaczenie (nie w kazdym batchu): model/rev/MHz/flash ->
     // devices.chip; korelacja czasow TLS/probe ze sprzetem
     static char s_chip[48] = {0};
@@ -158,8 +173,17 @@ static void push_remote_entities(JsonObject user_obj, JsonArray pub_arr,
 }
 
 // ── Handlery per typ wiadomości ───────────────────────────────
+// Baza zegara UTC: epoch z identified + millis() w tej chwili. Odświeżane przy każdym
+// (re)connect — dryf ESP32 rzędu sekund/dobę nie ma szans narosnąć między reconnectami.
+static uint32_t s_epoch_base = 0, s_epoch_ms = 0;
+uint32_t ws_epoch_now() {
+    if (!s_epoch_base) return 0;
+    return s_epoch_base + (millis() - s_epoch_ms) / 1000UL;
+}
+
 static void on_identified(JsonDocument& doc) {
     uint32_t st = doc["server_time"] | 0;   // czas serwera (informacyjnie)
+    if (st > 1700000000UL) { s_epoch_base = st; s_epoch_ms = millis(); }
 
     // Ustanów klucz sesji: be_nonce (hex) z identified + s_fw_nonce z identify → ECDH+HKDF.
     // Dopiero po sukcesie oznaczamy WS jako gotowy — od tej chwili wszystko idzie szyfrowane (BIN).
@@ -314,10 +338,57 @@ static void on_ota(JsonDocument& doc) {
     ota_handle(doc);
 }
 
-// RemoteTerminal (v0.65+): tunel TCP do LAN-u. Owner-only egzekwuje BE; node ma lokalny gate
-// (NVS remote_ok) + tylko prywatne cele. Stary FW ignoruje te typy.
+// RemoteTerminal (v0.65+): tunel TCP do LAN-u. Lokalna bramka = klucz parowania (pairing.h),
+// ustawiany wyłącznie po LAN — BE nie ma jak go podłożyć. Plus tylko prywatne cele.
+//
+// Otwarcie wymaga DOWODU od właściciela: HMAC-SHA256(klucz_parowania, msg), gdzie
+//   msg = "sensmos-tun-open|<device_id>|<ip>|<port>|<ts>"
+// BE tylko PRZEPYCHA `ts` i `proof` z apki — nie ma klucza, więc nie potrafi ich wytworzyć
+// ani podmienić celu (ip i port siedzą W ŚRODKU podpisywanego ciągu). To jest rdzeń całej
+// zmiany: bez tego skompromitowany serwer otwierał tunel do cudzego LAN-u sam z siebie.
+//
+// `ts` + okno czasowe są konieczne OBOK dowodu: sam HMAC byłby ważny w nieskończoność,
+// więc raz podejrzany `proof` dałoby się odtworzyć choćby za tydzień. Zmiana `ts` zmienia
+// wymagany HMAC, a tego bez klucza nie da się przeliczyć.
+#define TUN_OPEN_WINDOW_S 60
+
 static void on_tun_open(JsonDocument& doc) {
-    tunnel_on_open((int)(doc["tid"] | 0), doc["ip"] | "", (int)(doc["port"] | 0));
+    const int   tid  = (int)(doc["tid"] | 0);
+    const char* ip   = doc["ip"] | "";
+    const int   port = (int)(doc["port"] | 0);
+    const char* proof_hex = doc["proof"] | "";
+    const uint32_t ts = (uint32_t)(doc["ts"] | 0);
+
+    auto deny = [&](const char* why) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "{\"type\":\"tun_state\",\"tid\":%d,\"st\":\"error\",\"msg\":\"%s\"}", tid, why);
+        ws_client_send_raw(buf);
+        LOGW("tun", "tun_open ODRZUCONY: %s", why);
+    };
+
+    if (!pairing_has_key())      { deny("node not paired"); return; }
+    if (strlen(proof_hex) != 64) { deny("missing proof");   return; }
+
+    // Bez NTP nie umiemy ocenić świeżości, więc nie wolno przepuścić — inaczej okno czasowe
+    // przestaje cokolwiek znaczyć i dowód staje się wieczny.
+    if (!ntp_synced()) { deny("node clock not synced"); return; }
+    uint32_t now = ntp_unix_time();
+    uint32_t age = now > ts ? now - ts : ts - now;
+    if (age > TUN_OPEN_WINDOW_S) { deny("stale timestamp"); return; }
+
+    uint8_t proof[32];
+    for (int i = 0; i < 32; i++) {
+        unsigned v;
+        if (sscanf(proof_hex + i * 2, "%2x", &v) != 1) { deny("proof not hex"); return; }
+        proof[i] = (uint8_t)v;
+    }
+
+    char msg[192];
+    snprintf(msg, sizeof(msg), "sensmos-tun-open|%s|%s|%d|%lu",
+             g_device_id, ip, port, (unsigned long)ts);
+    if (!pairing_verify(msg, proof)) { deny("bad proof"); return; }
+
+    tunnel_on_open(tid, ip, port);
 }
 static void on_tun_data(JsonDocument& doc) {
     tunnel_on_data((int)(doc["tid"] | 0), doc["d"] | "");
@@ -325,9 +396,82 @@ static void on_tun_data(JsonDocument& doc) {
 static void on_tun_close(JsonDocument& doc) {
     tunnel_on_close((int)(doc["tid"] | 0));
 }
-static void on_tun_cfg(JsonDocument& doc) {
-    tunnel_set_enabled((bool)(doc["enable"] | false));
+
+#if LORA_ENABLED
+// BE dyktuje plan pasma i slot nadawania (rola jak check_jobs dla sieci). Sam harmonogram
+// liczy się z zegara UTC, więc ta ramka nie musi przychodzić punktualnie — tylko raz.
+static void on_lora_cfg(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_cfg")) return;
+    LoraLinkCh ch[LORA_LINK_MAX_CH];
+    uint8_t n = 0;
+    for (JsonObject c : doc["scan"].as<JsonArray>()) {
+        if (n >= LORA_LINK_MAX_CH) break;
+        memset(&ch[n], 0, sizeof(LoraLinkCh));
+        ch[n].freq = c["freq"] | 868.3f;
+        ch[n].bw   = c["bw"]   | 125.0f;
+        ch[n].sf   = c["sf"]   | 9;
+        ch[n].cr   = c["cr"]   | 5;
+        ch[n].sync = (uint8_t)(c["sync"] | 0x34);
+        ch[n].mode = (uint8_t)(c["mode"] | 0);
+        if (ch[n].mode == 1) {
+            ch[n].br  = c["br"]  | 4.8f;
+            ch[n].dev = c["dev"] | 5.0f;
+            ch[n].len = (uint8_t)(c["len"] | 0);
+            ch[n].flags = (uint8_t)((c["crc"] | 0 ? 0x01 : 0) |
+                                    (c["white"] | 0 ? 0x02 : 0) |
+                                    (c["fixed"] | 0 ? 0x04 : 0));
+            // sync jako ciąg hex ("543d") — bajty, nie jedna liczba jak w LoRa
+            const char* sh = c["syncb"] | "";
+            uint8_t k = 0;
+            for (const char* p = sh; p[0] && p[1] && k < 8; p += 2) {
+                char b[3] = { p[0], p[1], 0 };
+                ch[n].syncb[k++] = (uint8_t)strtoul(b, nullptr, 16);
+            }
+            ch[n].syncn = k;
+        }
+        n++;
+    }
+    JsonObject b = doc["beacon"];
+    lora_link_set((bool)(doc["on"] | false), (bool)(b["on"] | false),
+                  (uint8_t)(b["slot"] | 0), (uint16_t)(b["every_s"] | 60),
+                  (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n);
 }
+
+// Skan całego pasma na żądanie BE. Przerywa nasłuch na kilka sekund, po czym tryb link
+// wraca sam (zlecenie zeruje bieżący kanał, więc następny tick przestraja radio).
+static void on_lora_scan(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_scan")) return;
+    lora_sweep(doc["from"] | 863.0f, doc["to"] | 870.0f, doc["step"] | 0.2f);
+}
+
+// Nasłuch energii na JEDNEJ częstotliwości przez N sekund — odpowiada na pytanie
+// „czy tu w ogóle coś nadaje", niezależnie od modulacji. Skan pasma tego nie powie,
+// bo stoi na każdym punkcie ułamek sekundy.
+static void on_lora_camp(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_camp")) return;
+    lora_camp(doc["freq"] | 869.525f, doc["secs"] | 120);
+}
+// listen/cad/hunt/bg istnialy od poczatku, ale WYLACZNIE spod seriala — czyli dla noda
+// bez kabla nie istnialy wcale. Ten sam brak naprawiono wczesniej dla sweepa i campa.
+static void on_lora_listen(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_listen")) return;
+    lora_listen(doc["freq"] | 868.1f, doc["bw"] | 125.0f, doc["sf"] | 7,
+                doc["cr"] | 5, doc["sync"] | 0x34, doc["secs"] | 30);
+}
+static void on_lora_cad(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_cad")) return;
+    lora_cad(doc["freq"] | 869.525f, doc["bw"] | 62.5f, doc["sf"] | 8, doc["secs"] | 30);
+}
+static void on_lora_hunt(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_hunt")) return;
+    lora_hunt(doc["freq"] | 869.525f, doc["bw"] | 62.5f, doc["sf"] | 8,
+              doc["cr"] | 5, doc["dwell_ms"] | 3000);
+}
+static void on_lora_bg(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_bg")) return;
+    lora_bg_set(doc["on"] | true);
+}
+#endif
 
 // ── Tablica dispatchu ─────────────────────────────────────────
 typedef void (*ws_handler_t)(JsonDocument&);
@@ -355,7 +499,16 @@ static const WsEntry WS_TABLE[] = {
     { "tun_open",          on_tun_open },
     { "tun_data",          on_tun_data },
     { "tun_close",         on_tun_close },
-    { "tun_cfg",           on_tun_cfg },
+    { "fw_digest",         fw_digest_on_ws },
+#if LORA_ENABLED
+    { "lora_cfg",          on_lora_cfg },
+    { "lora_scan",         on_lora_scan },
+    { "lora_camp",         on_lora_camp },
+    { "lora_listen",       on_lora_listen },
+    { "lora_cad",          on_lora_cad },
+    { "lora_hunt",         on_lora_hunt },
+    { "lora_bg",           on_lora_bg },
+#endif
     { "error",             on_error },
 };
 
