@@ -84,12 +84,12 @@
 #define SERVICE_BTN_RESET_MS  10000
 
 // ── WebSocket ─────────────────────────────────────────────────
-// WS plaintext (ws://host:80/v1/ws) — trwały TLS (BearSSL) zjadałby ~28KB, stąd default 1.
-// Dane i tak podpisane kryptograficznie (integralność niezależna od TLS). HTTP/fetch zostają
-// po https (połączenia chwilowe — alokują TLS tylko na czas i zwalniają). 0 = wss jak z backend_url.
-// Env TLS (SENSMOS_USE_TLS, nodemcuv2_tls): downgrade jest WYŁĄCZONY niezależnie od tej flagi —
-// transport idzie po wss:// przez wolfSSL (WsTlsClient, ~2.9KB rezydenta); ws_enc (szyfrowanie
-// aplikacyjne ECDH+AES-GCM) pozostaje aktywne w obu wariantach — TLS to warstwa NIŻEJ.
+// Od 2026-08-24 SENSMOS_USE_TLS jest zdefiniowane w SHIPPINGOWYM buildzie (platformio.ini)
+// — transport to wss:// przez wolfSSL (WsTlsClient, pinning ISRG Root X2, ~2.9KB rezydenta),
+// a ponizszy downgrade plaintext jest WYLACZONY na stale (gate w ws_client.cpp:
+// `#if WS_PLAINTEXT && !defined(SENSMOS_USE_TLS)`). WS_PLAINTEXT zostaje jako szczatkowy
+// przelacznik dla hipotetycznego builda bez TLS-a. ws_enc (szyfrowanie aplikacyjne
+// ECDH+AES-GCM) dziala bez zmian — TLS to warstwa NIZEJ.
 #define WS_PLAINTEXT          1
 #define WS_PLAINTEXT_PORT     80
 

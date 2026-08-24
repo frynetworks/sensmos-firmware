@@ -8,6 +8,7 @@
 #endif
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfio.h>
+#include "ca_cert.h"   // kotwica pinningu (PROGMEM) — tylko ten TU, patrz komentarz w ca_cert.h
 
 // Trwały transport wss:// dla arduinoWebSockets (WsTlsClient) + jednorazowy PoC pomiarowy.
 // CTX wolfSSL jest współdzielony i inicjalizowany RAZ (nigdy nie zwalniany) — biblioteka
@@ -20,8 +21,8 @@ static WOLFSSL_CTX* g_ctx = nullptr;
 
 // [tls-heap] line is DELIBERATELY not in the "heap <N>k" shape — see log.cpp's [mem] comment:
 // tools/gate_heap.py's HEAP_RE would otherwise vacuum these readings into its min_heap gate.
-// This transport only ever runs in the separate nodemcuv2_tls env, never the gated shipping
-// build, but the naming discipline is kept so the two builds' logs stay distinguishable.
+// Od flipu 2026-08-24 ten transport JEST w shippingowym buildzie (SENSMOS_USE_TLS domyslne);
+// dyscyplina nazewnicza heap= obowiazuje tym bardziej.
 static void ws_tls_print_heap(const char* label) {
     uint32_t dram_free = ESP.getFreeHeap();
     uint32_t dram_blk  = ESP.getMaxFreeBlockSize();
@@ -86,8 +87,43 @@ static bool ws_tls_ctx_ensure() {
         wolfSSL_Cleanup();
         return false;
     }
-    // Bez weryfikacji certu (postawa PoC — pinning jak w identify/ECDH to follow-up).
-    wolfSSL_CTX_set_verify(g_ctx, WOLFSSL_VERIFY_NONE, nullptr);
+    // Pinning: ISRG Root YE jako kotwica (ca_cert.h — dlaczego nie X2/X1: czas P-384 vs HW WDT).
+    // PROGMEM -> tymczasowy bufor heap (543B): XMEMCPY wolfSSL-a nie jest pgm-aware.
+    // Degradacja: gdy load padnie (malloc/format), VERIFY_NONE + log — node ma dzialac,
+    // nie cegla; degradacje widac w serialu i mozna ja zlapac w QA.
+    {
+        bool pinned = false;
+        uint8_t* ca = (uint8_t*)malloc(CA_ANCHOR_DER_LEN);
+        if (ca) {
+            memcpy_P(ca, CA_ANCHOR_DER, CA_ANCHOR_DER_LEN);
+            // DATE_ERR_OKAY: load leci przy boocie, czesto PRZED zsynchronizowaniem NTP
+            // (zegar 1970 -> notBefore kotwicy "w przyszlosci" -> ASN_BEFORE_DATE_E -150 i
+            // degradacja do VERIFY_NONE). Daty certow PEER-a i tak sa sprawdzane przy
+            // kazdym handshake'u — race NTP konczy sie retry'em reconnectu, nie dziura.
+            int ret = wolfSSL_CTX_load_verify_buffer_ex(g_ctx, ca, CA_ANCHOR_DER_LEN,
+                                                        WOLFSSL_FILETYPE_ASN1, 0,
+                                                        WOLFSSL_LOAD_FLAG_DATE_ERR_OKAY);
+            free(ca);
+            if (ret == WOLFSSL_SUCCESS) {
+                pinned = true;
+            } else {
+                LOGW("tls", "CA load failed ret=%d — verify disabled (degraded)", ret);
+            }
+        } else {
+            LOGW("tls", "CA buffer alloc failed (dram_free=%u) — verify disabled (degraded)",
+                 (unsigned)ESP.getFreeHeap());
+        }
+        wolfSSL_CTX_set_verify(g_ctx, pinned ? WOLFSSL_VERIFY_PEER : WOLFSSL_VERIFY_NONE,
+                               nullptr);
+        if (pinned) LOGI("tls", "cert pinning active: ISRG Root YE, VERIFY_PEER");
+    }
+    // HAVE_ECC384 (potrzebny TYLKO do weryfikacji lancucha P-384) reklamowalby tez
+    // secp384r1 w key_share — serwer moglby go wybrac, a keygen P-384 idzie na
+    // generycznym sp_int = powrot OOM err -125. Wymiana kluczy przybita do P-256.
+    {
+        int groups[] = { WOLFSSL_ECC_SECP256R1 };
+        wolfSSL_CTX_set_groups(g_ctx, groups, 1);
+    }
     wolfSSL_CTX_SetIOSend(g_ctx, ws_tls_io_send_cb);
     wolfSSL_CTX_SetIORecv(g_ctx, ws_tls_io_recv_cb);
     ws_tls_print_heap("post-ctx-new");
@@ -141,6 +177,12 @@ int WsTlsClient::tlsConnect(IPAddress ip, uint16_t port, const char* sniHost) {
     // karmią SW+HW WDT (patrz main.cpp: ESP.wdtEnable(8000)); jedyny koszt to kosmetyczny
     // "[loop] slow pass" przy reconnect'cie.
     LOGI("tls", "handshake starting: %s:%u", sniHost ? sniHost : "(ip)", (unsigned)port);
+    // SW WDT na 8266 ma STALE ~3.2s (parametr wdtEnable jest ignorowany przez core),
+    // a lancuch P-384 to >3s nieprzerwanego liczenia w JEDNYM wolfSSL_connect
+    // (ProcessPeerCerts robi wszystkie weryfikacje ciurkiem — nic nie woła yield).
+    // SW WDT wyłączony NA CZAS handshake'u; HW WDT (~8.4s, niewyłączalny) zostaje
+    // jako backstop — pełne SP liczy chain w ~3-5s, mieści się.
+    ESP.wdtDisable();
     unsigned long deadline = millis() + HS_DEADLINE_MS;
     int ret;
     for (;;) {
@@ -153,6 +195,7 @@ int WsTlsClient::tlsConnect(IPAddress ip, uint16_t port, const char* sniHost) {
             yield();
             continue;
         }
+        ESP.wdtEnable(8000);
         char errBuf[WOLFSSL_MAX_ERROR_SZ];
         wolfSSL_ERR_error_string(err, errBuf);
         LOGE("tls", "handshake failed: err=%d (%s)", err, errBuf);
@@ -161,6 +204,7 @@ int WsTlsClient::tlsConnect(IPAddress ip, uint16_t port, const char* sniHost) {
         WiFiClient::stop();
         return 0;
     }
+    ESP.wdtEnable(8000);
 
     _hsDone = true;
     ws_tls_print_heap("post-handshake-ok");

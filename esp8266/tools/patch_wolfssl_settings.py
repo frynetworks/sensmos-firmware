@@ -67,7 +67,31 @@ CONTENT = """#ifndef WOLFSSL_USER_SETTINGS_H
 /* Samo SP_ECC zmniejsza generyczne SP_INT ponizej potrzeb RSA
  * (#error "SP_INT_BITS too small for WOLFSSL_MAX_RSA_BITS") — RSA tez na SP. */
 #define WOLFSSL_HAVE_SP_RSA
-#define WOLFSSL_SP_SMALL
+/* BEZ WOLFSSL_SP_SMALL: wariant small robil pojedyncza weryfikacje ECDSA P-384
+ * dluzsza niz ~6s nieprzerwanego liczenia -> HW WDT resetowal node w polowie
+ * handshake'u (rst cause:2 w petli; nic nie karmi WDT wewnatrz sp_c32). Pelne SP
+ * jest ~5-10x szybsze — kosztem flasha, ktorego jest pod dostatkiem. */
+
+/* Pinning certyfikatu (ISRG Root X2): lancuch api.sensmos.com to ECDSA P-384 +
+ * SHA-384 na KAZDYM poziomie (leaf podpisany ecdsa-with-SHA384 kluczem P-384 YE2)
+ * — bez tych dwoch define'ow VERIFY_PEER nie ma czym zweryfikowac ani jednego
+ * podpisu. P-384 liczy sie na generycznym sp_int (fallback WOLFSSL_SP_MATH_ALL;
+ * NIE dodawac WOLFSSL_SP_384 — flash). Wymiana kluczy ZOSTAJE na P-256:
+ * ws_tls.cpp ogranicza grupy przez wolfSSL_CTX_set_groups — HAVE_ECC384 bez tego
+ * reklamowalby secp384r1 w key_share i keygen P-384 na generycznym sp_int
+ * powtorzylby OOM err -125 (ecc_make_pub_ex), naprawiony wyzej przez SP_ECC. */
+#define HAVE_ECC384
+#define WOLFSSL_SHA384
+/* Weryfikacja ECDSA P-384 na generycznym sp_int (SP_MATH_ALL fallback) zwracala
+ * -155 ASN_SIG_CONFIRM_E na KAZDYM podpisie lancucha (trace: ConfirmSignature
+ * failed przy "CA found") — dedykowana sciezka SP dla P-384 liczy poprawnie,
+ * tak samo jak SP_ECC naprawilo P-256. Koszt: flash, zero DRAM. */
+#define WOLFSSL_SP_384
+/* Serwer wysyla lancuch az do cross-certa X2-podpisanego-przez-X1; domyslnie wolfSSL
+ * weryfikuje KAZDY przedstawiony cert CA i pada z ASN_NO_SIGNER_E (-188), bo X1 nie
+ * jest w store. ALT_CERT_CHAINS: wystarczy, ze lancuch domyka sie do zaufanego X2 —
+ * nadmiarowy cross-cert jest ignorowany (zachowanie jak w OpenSSL/przegladarkach). */
+#define WOLFSSL_ALT_CERT_CHAINS
 
 /* wolfcrypt/test/test.c and benchmark.c are ESP-IDF example harnesses (ESP_LOGE,
  * sdkconfig.h) this project never calls — exclude them from the build entirely. */

@@ -239,24 +239,51 @@ identity during the handshake, and optionally pin a hash of the backend's TLS ce
 for out-of-band checks. Cost: ~32–64 B. Adds server authentication with no TLS stack at all.
 Missing: record-layer protection and protocol negotiation.
 
-**Option 3 — wolfSSL — INTEGRATED as the persistent wss:// transport (2026-08-24); verified live
-against the production backend.**
-wolfSSL is now the actual WebSocket transport in the `nodemcuv2_tls` env — not a one-shot PoC.
-`ws_tls.h`/`ws_tls.cpp` provide `WsTlsClient` (a `WiFiClient` subclass), which arduinoWebSockets
-instantiates in place of BearSSL's `WiFiClientSecure`; the node connects to
-`wss://api.sensmos.com:443/v1/ws` (the backend's nginx already terminates TLS on the same
-`/v1/ws` route — verified 101 Switching Protocols), completes the app-layer identify/ECDH
-handshake over TLS, and runs normally. The shipping `nodemcuv2` build is byte-identical
-(54,072 B RAM) — every change is gated behind `SENSMOS_USE_TLS`. Integration mechanics:
+**Option 3 — wolfSSL — THE SHIPPING TRANSPORT (2026-08-24): wss:// with cert-pinned VERIFY_PEER
+is now the default `nodemcuv2` build.**
+`SENSMOS_USE_TLS` moved into the shipping env: every flashed node connects to
+`wss://api.sensmos.com:443/v1/ws` (nginx terminates TLS on the same `/v1/ws` route — verified
+101 Switching Protocols) through `WsTlsClient` (`ws_tls.h`/`ws_tls.cpp`, a `WiFiClient`
+subclass), verifies the server chain against a pinned CA, completes the app-layer identify/ECDH
+handshake over TLS, and runs normally. `nodemcuv2_tls` remains as a legacy alias;
+`nodemcuv2_diag` inherits TLS. Shipping build: **54,404 B RAM (66.4 %), 898,839 B flash
+(86.1 %)**. `WS_PLAINTEXT` is vestigial (permanently overridden by `SENSMOS_USE_TLS`).
 
+* **Certificate pinning (VERIFY_PEER):** the anchor is **ISRG Root YE** (Let's Encrypt's 2026
+  P-384 intermediate hierarchy: leaf P-256 ← YE2 P-384 ← Root YE P-384 ← [X2-cross]), embedded
+  DER in PROGMEM (`src/ca_cert.h`, 682 B) and loaded once with
+  `WOLFSSL_LOAD_FLAG_DATE_ERR_OKAY` (the load runs before NTP settles; peer-cert dates are
+  still checked at every handshake). Three hard-won findings baked into the config:
+  `WOLFSSL_ALT_CERT_CHAINS` (the server's chain ends with an X2-cross-signed-by-X1 cert wolfSSL
+  would otherwise demand a signer for → −188), `WOLFSSL_SP_384` full-speed (generic-math P-384
+  ECDSA verify returned −155 on every signature; and the `WOLFSSL_SP_SMALL` variant needed >6 s
+  per verify → hardware-WDT reset loop — full SP does ~2.7 s), and the anchor deliberately
+  placed at Root YE, not ISRG Root X2: each P-384 verify is ~2.7 s of uninterruptible compute
+  and the ESP8266's HW WDT (~8.4 s, cannot be disabled) killed the 3-verify chain to X2; two
+  verifies fit (~6.6 s total handshake). The SW WDT (fixed ~3.2 s — `wdtEnable`'s argument is
+  ignored by the core) is disabled for the handshake window only. Not X1 either: its RSA-4096
+  signature would force `SP_INT_BITS 4096` = +256 B on every bignum. Key exchange stays pinned
+  to P-256 via `wolfSSL_CTX_set_groups` — `HAVE_ECC384` would otherwise advertise secp384r1 in
+  key_share and P-384 keygen on generic math would repeat the old −125 OOM. Graceful
+  degradation: if the CA can't load (malloc/format), the node logs `verify disabled (degraded)`
+  and continues with VERIFY_NONE rather than bricking. Anchor expires 2032-09-02; on Let's
+  Encrypt hierarchy rotation, re-extract the chain (`openssl s_client -showcerts`) and rebuild
+  `ca_cert.h`.
+* **`WEBSOCKETS_MAX_DATA_SIZE=4096` finally works** — and the truth about it: the library
+  hard-defines 15 KB with no `#ifndef` (WebSockets.h:66), so the `-D` flag had been silently
+  clobbered since it was added; the effective inbound cap on every prior build was 15 KB. The
+  patch script now wraps the define so the flag wins. This is **hardening, not a heap win**:
+  the cap is a reject-before-malloc bound (the RX buffer is a per-frame `malloc(payloadLen)`,
+  not a static allocation) — it limits the largest transient allocation a malicious or buggy
+  peer can induce.
 * **arduinoWebSockets 2.7.3 hard-codes its SSL class** (`WEBSOCKETS_NETWORK_SSL_CLASS
   WiFiClientSecure`, WebSockets.h:213, no `#ifndef` — `-D` overrides are silently clobbered)
   and `new`s it internally (`_client.tcp = _client.ssl`, so the SSL class must derive
-  `WiFiClient`). Solved with `tools/patch_websockets_tls.py` (TLS-env-only `pre:` script, same
-  pattern as the wolfSSL config hook): it patches the *libdeps copy* of WebSockets.h to select
-  `WsTlsClient` under `SENSMOS_USE_TLS`, injecting the header by absolute path (deliberately not
-  `-Isrc` — `src/` carries `WiFi.h`/`HTTPClient.h` compat shims that would shadow library
-  headers in every TU).
+  `WiFiClient`). Solved with `tools/patch_websockets_tls.py` (`pre:` script on the shipping
+  env, same pattern as the wolfSSL config hook): it patches the *libdeps copy* of WebSockets.h
+  to select `WsTlsClient` under `SENSMOS_USE_TLS` and to guard `MAX_DATA_SIZE`, injecting the
+  header by absolute path (deliberately not `-Isrc` — `src/` carries `WiFi.h`/`HTTPClient.h`
+  compat shims that would shadow library headers in every TU).
 * **`WsTlsClient` details that matter:** all I/O rides the virtual `Client` interface (verified
   against the core headers); WiFiClient's zero-copy peek-buffer API is overridden OFF (it reads
   raw lwIP pbufs = ciphertext); BearSSL-named config calls (`setInsecure` — called twice by the
