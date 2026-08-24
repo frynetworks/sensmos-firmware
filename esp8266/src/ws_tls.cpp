@@ -75,7 +75,10 @@ static bool ws_tls_init() {
     }
     ws_tls_print_heap("post-wolfssl-init");
 
-    g_ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
+    // v23 = TLS1.3-preferowany Z downgrade=1 (wolfTLSv1_3_client_method ma downgrade=0
+    // i odrzuca ServerHello 1.2 jako err -326). NO_OLD_TLS przybija WOLFSSL_MIN_DOWNGRADE
+    // do TLS1.2 — nizej nie zejdzie, bez zadnego SetMinVersion.
+    g_ctx = wolfSSL_CTX_new(wolfSSLv23_client_method());
     if (!g_ctx) {
         LOGW("tls", "TLS1.3 CTX unavailable, falling back to TLS1.2");
         g_ctx = wolfSSL_CTX_new(wolfTLSv1_2_client_method());

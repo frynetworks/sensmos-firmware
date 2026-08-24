@@ -51,6 +51,23 @@ CONTENT = """#ifndef WOLFSSL_USER_SETTINGS_H
  * wolfSSL_UseSNI() needs it explicitly. */
 #define HAVE_SNI
 #define HAVE_TLS_EXTENSIONS
+/* Bez tego wolfSSL 5.7.2 buduje klienta TLS1.3, ktorego ClientHello NIE zawiera
+ * supported_groups ANI key_share (oba gatowane w tls.c wylacznie na ten define,
+ * zadny #error tego nie lapie) — serwer nie moze zrobic 1.3, downgraduje,
+ * a klient przybity do 1.3 odrzuca to jako err -326 (VERSION_ERROR). */
+#define HAVE_SUPPORTED_CURVES
+
+/* Generyczny backend sp_int wymiaruje kazdy bignum pod RSA (4096 bit ≈ 1KB kazdy;
+ * ecc_point zawiera 3) — ecc_make_pub_ex przy generowaniu key_share przekraczal
+ * przejsciowo ~17KB wolnego bloku i padal z err -125 (MEMORY_E) [trace: EccMakeKey
+ * -> ecc_make_pub_ex failed]. Dedykowane procedury SP dla P-256 (sp_c32.c) maja
+ * male, stale bufory i sa duzo szybsze; RSA (weryfikacja certu) zostaje na
+ * generycznym sp_int — pojedyncze ~4KB transienty, miesci sie. */
+#define WOLFSSL_HAVE_SP_ECC
+/* Samo SP_ECC zmniejsza generyczne SP_INT ponizej potrzeb RSA
+ * (#error "SP_INT_BITS too small for WOLFSSL_MAX_RSA_BITS") — RSA tez na SP. */
+#define WOLFSSL_HAVE_SP_RSA
+#define WOLFSSL_SP_SMALL
 
 /* wolfcrypt/test/test.c and benchmark.c are ESP-IDF example harnesses (ESP_LOGE,
  * sdkconfig.h) this project never calls — exclude them from the build entirely. */

@@ -287,37 +287,54 @@ wolfSSL's published numbers:
   handler, so 8/16-bit reads from flash work — slowly, which is acceptable for a PoC measurement
   path. Result: TLS image DRAM static **80,732 → 54,616 B (66.5 %)**, boot heap ≈ 27 KB, on par
   with the shipping build. The shipping `nodemcuv2` env never loads this script and is untouched.
-* **On-device `[tls-heap]` measurements (nodemcuv2, 160 MHz, WS backend connected after PoC):**
+* **The first flashed build then failed its handshake with err −326 (record layer version
+  error) — root-caused to a silent config gap, since fixed.** wolfSSL 5.7.2 gates BOTH the
+  `supported_groups` and the TLS 1.3 `key_share` ClientHello extensions solely on
+  `HAVE_SUPPORTED_CURVES` (no `#error` catches its absence), while still advertising
+  `supported_versions: 1.3` — producing a ClientHello no server can complete TLS 1.3 against.
+  httpbin.org answers with a TLS 1.2 ServerHello, and `wolfTLSv1_3_client_method()` (which sets
+  `downgrade=0`) rejects that as −326. Three-part fix: (1) `HAVE_SUPPORTED_CURVES` added to the
+  generated `user_settings.h`; (2) `wolfSSLv23_client_method()` in `ws_tls.cpp` — TLS 1.3-preferred
+  with `downgrade=1`, floor clamped to TLS 1.2 via `NO_OLD_TLS`'s `WOLFSSL_MIN_DOWNGRADE`;
+  (3) `WOLFSSL_HAVE_SP_ECC` + `WOLFSSL_HAVE_SP_RSA` + `WOLFSSL_SP_SMALL` — the generic `sp_int`
+  backend sizes every bignum for RSA (≈1 KB each; an `ecc_point` embeds three), so the key_share
+  P-256 keygen exceeded the free block transiently and died with −125/MEMORY_E
+  (`EccMakeKey → ecc_make_pub_ex failed`, confirmed via a temporary `DEBUG_WOLFSSL` trace build);
+  the dedicated SP routines use small fixed buffers and are far faster. Cost: +27.8 KB flash
+  (82.8 % total), +0 B DRAM.
+* **On-device `[tls-heap]` measurements — SUCCESSFUL handshake (nodemcuv2, 160 MHz):**
 
   | Stage | DRAM free | Max block | Frag | IRAM free | Δ vs baseline |
   |---|---:|---:|---:|---:|---:|
   | baseline (pre-wolfSSL) | 20,752 | 20,168 | 3 % | 12,520 | — |
   | post-wolfSSL_Init | 20,752 | 20,168 | 3 % | 12,520 | 0 |
-  | post-CTX_new | 20,488 | 20,168 | 2 % | 12,520 | −264 |
+  | post-CTX_new | 20,608 | 20,168 | 3 % | 12,520 | −144 |
   | post-config | 20,608 | 20,168 | 3 % | 12,520 | −144 |
   | pre-connect | 20,608 | 20,168 | 3 % | 12,520 | −144 |
-  | post-tcp-connect | 20,224 | 19,976 | 2 % | 12,520 | −528 |
-  | post-SSL_new | 17,864 | 17,704 | 1 % | 12,520 | −2,888 |
-  | post-handshake-fail | 13,904 | 13,744 | 2 % | 12,520 | −6,848 |
-  | post-cleanup | 18,328 | 15,240 | 16 % | 12,520 | −2,424 |
+  | post-tcp-connect | 20,224 | 20,056 | 1 % | 12,520 | −528 |
+  | post-SSL_new | 17,864 | 17,784 | 1 % | 12,520 | −2,888 |
+  | post-handshake-ok | 17,904 | 13,368 | 24 % | 12,520 | −2,848 |
+  | steady-state | 17,904 | 13,368 | 24 % | 12,520 | −2,848 |
+  | post-disconnect | 19,912 | 13,368 | 29 % | 12,520 | −840 |
+  | post-cleanup | 20,528 | 13,368 | 28 % | 12,520 | −224 |
 
-  The handshake itself **failed with wolfSSL err −326 (record layer version error)** against
-  `httpbin.org:443` ~200 ms in, so no post-handshake-ok/steady-state rows exist — that is a
-  protocol/config issue in the TLS 1.3-only PoC configuration, **not a memory failure**: the
-  device completed the full lifecycle, printed every instrumentation stage, cleaned up, and then
-  connected to the production WS backend and ran normally (`ws=up`, heap 14 k steady, frag 7 %,
-  zero crashes across the capture). IRAM (second heap) is untouched throughout — wolfSSL
-  allocates purely from the DRAM heap (there is no XMALLOC/IRAM routing in this PoC).
+  **Handshake: PASS in ~1.28 s — `TLSv1.2`, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, SNI on,
+  `HTTP/1.1 200 OK` received** from `https://httpbin.org/get` (191 B read). The stage snapshots
+  bound the *resident* cost; the transient keygen/handshake peak between snapshots is what the SP
+  routines keep inside the free block (the max-block drop 17,784 → 13,368 with frag 24 % is the
+  handshake churn's footprint). Post-cleanup recovers to within 224 B of baseline. IRAM (second
+  heap) is untouched throughout — wolfSSL allocates purely from the DRAM heap (no XMALLOC/IRAM
+  routing in this PoC).
 
-**Conclusion: wolfSSL now fits this port.** Measured cost on-device: ~26.1 KB flash (relocated
-`.rodata`) + ~0.5 KB extra DRAM static vs the shipping build + **≥ 6.8 KB peak DRAM heap during a
-(failed, ~200 ms) handshake** — a completed TLS 1.3 handshake will peak higher; with ~20.7 KB free
-at PoC start the margin is comfortable. Post-cleanup the heap recovers to within 2.4 KB of
-baseline (fragmentation 16 % immediately after, settling to 7 %). The remaining work for a real
-TLS transport is protocol-level (resolve the −326 version error, then re-measure
-post-handshake-ok/steady-state), not memory-level. The earlier conclusion that only ESP32-class
-hardware could host wolfSSL is superseded by these measurements; wolfSSL's published figures
-below remain useful context for an eventual full integration.
+**Conclusion: wolfSSL fits this port and completes a real TLS handshake against a public
+endpoint.** Measured on-device cost: ~54 KB flash total (26.1 KB relocated `.rodata` + 27.8 KB SP
+P-256/RSA-2048 code) + ~0.5 KB extra DRAM static vs the shipping build + **≈ 2.9 KB resident DRAM
+heap for an open TLS session** (SSL object dominant), with handshake transients absorbed inside a
+~17 KB free block and full recovery (−224 B) after cleanup. Handshake time ~1.28 s at 160 MHz.
+The earlier conclusion that only ESP32-class hardware could host wolfSSL is superseded; the
+remaining engineering for a production TLS WS transport is integration work (persistent session
+handling, reconnect policy, coexistence with the ~10-11 k steady-state heap while a batch is in
+flight), not feasibility. wolfSSL's published figures below remain useful context.
 
 <details>
 <summary>wolfSSL's published numbers (context, not achieved here)</summary>
