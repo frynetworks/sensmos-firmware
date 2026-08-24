@@ -37,7 +37,7 @@ src/
 
 ## Ports in this fork
 
-This fork adds two alternative node implementations alongside the upstream ESP32 firmware:
+This fork adds three alternative node implementations alongside the upstream ESP32 firmware:
 
 ### `esp8266/` — ESP8266 firmware port
 
@@ -57,6 +57,10 @@ pio run -t upload --upload-port <COMx>    # flash
 ```
 
 See [esp8266/README.md](esp8266/README.md) for the onboarding flow, serial tools, and known limits.
+
+### `nrf52840/` — Seeed XIAO nRF52840 port (LoRa/SX1262 sole transport)
+
+PlatformIO port for the XIAO nRF52840 + Wio-SX1262 — a node with **no WiFi hardware**: LoRa is the only radio uplink, BLE + USB-serial handle provisioning. Boot-time pinout probing covers the known XIAO/SX1262 wirings; data batches are ECDSA-signed and leave the node as chunked `0xE1`/`SMOSB` LoRa frames under the EU868 duty-cycle budget. See [nrf52840/README.md](nrf52840/README.md).
 
 ### `docker/` — containerized node
 
