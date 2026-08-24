@@ -185,9 +185,8 @@ void setup() {
             }
             LOGI("boot", "ready — heap %uk free, blk %uk",
                  ESP.getFreeHeap() / 1024, ESP.getMaxFreeBlockSize() / 1024);
-#ifdef SENSMOS_USE_TLS
-            ws_tls_run_poc_test();   // one-shot wolfSSL heap measurement — nodemcuv2_tls env only
-#endif
+            // (env TLS: wolfSSL jest teraz trwałym transportem wss:// w ws_client —
+            //  jednorazowy PoC ws_tls_run_poc_test() usunięty; otwierałby DRUGĄ sesję TLS.)
             node_running = true;
             watchdog_start();  // nieaktywny jeśli node_confirmed=true w NVS
         } else {

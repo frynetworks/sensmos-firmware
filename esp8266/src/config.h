@@ -84,9 +84,12 @@
 #define SERVICE_BTN_RESET_MS  10000
 
 // ── WebSocket ─────────────────────────────────────────────────
-// WS plaintext (ws://host:80/v1/ws) — trwały TLS zjadałby ~70KB heapu, a ESP32 tego nie ma.
+// WS plaintext (ws://host:80/v1/ws) — trwały TLS (BearSSL) zjadałby ~28KB, stąd default 1.
 // Dane i tak podpisane kryptograficznie (integralność niezależna od TLS). HTTP/fetch zostają
 // po https (połączenia chwilowe — alokują TLS tylko na czas i zwalniają). 0 = wss jak z backend_url.
+// Env TLS (SENSMOS_USE_TLS, nodemcuv2_tls): downgrade jest WYŁĄCZONY niezależnie od tej flagi —
+// transport idzie po wss:// przez wolfSSL (WsTlsClient, ~2.9KB rezydenta); ws_enc (szyfrowanie
+// aplikacyjne ECDH+AES-GCM) pozostaje aktywne w obu wariantach — TLS to warstwa NIŻEJ.
 #define WS_PLAINTEXT          1
 #define WS_PLAINTEXT_PORT     80
 

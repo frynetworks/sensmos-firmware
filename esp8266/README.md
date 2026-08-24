@@ -239,12 +239,51 @@ identity during the handshake, and optionally pin a hash of the backend's TLS ce
 for out-of-band checks. Cost: ~32–64 B. Adds server authentication with no TLS stack at all.
 Missing: record-layer protection and protocol negotiation.
 
-**Option 3 — wolfSSL — PoC built, linked, flashed, and measured on-device (2026-08-24); fits after static-RAM shrink + rodata relocation.**
-A working proof-of-concept now exists (`ws_tls.cpp`/`ws_tls.h`, gated behind the
-`SENSMOS_USE_TLS` build flag, isolated to its own `nodemcuv2_tls` PlatformIO environment so the
-shipping `nodemcuv2` build carries zero TLS code — confirmed byte-identical RAM/Flash usage with
-and without the PoC files present). Findings, from an actual build against this firmware, not
-wolfSSL's published numbers:
+**Option 3 — wolfSSL — INTEGRATED as the persistent wss:// transport (2026-08-24); verified live
+against the production backend.**
+wolfSSL is now the actual WebSocket transport in the `nodemcuv2_tls` env — not a one-shot PoC.
+`ws_tls.h`/`ws_tls.cpp` provide `WsTlsClient` (a `WiFiClient` subclass), which arduinoWebSockets
+instantiates in place of BearSSL's `WiFiClientSecure`; the node connects to
+`wss://api.sensmos.com:443/v1/ws` (the backend's nginx already terminates TLS on the same
+`/v1/ws` route — verified 101 Switching Protocols), completes the app-layer identify/ECDH
+handshake over TLS, and runs normally. The shipping `nodemcuv2` build is byte-identical
+(54,072 B RAM) — every change is gated behind `SENSMOS_USE_TLS`. Integration mechanics:
+
+* **arduinoWebSockets 2.7.3 hard-codes its SSL class** (`WEBSOCKETS_NETWORK_SSL_CLASS
+  WiFiClientSecure`, WebSockets.h:213, no `#ifndef` — `-D` overrides are silently clobbered)
+  and `new`s it internally (`_client.tcp = _client.ssl`, so the SSL class must derive
+  `WiFiClient`). Solved with `tools/patch_websockets_tls.py` (TLS-env-only `pre:` script, same
+  pattern as the wolfSSL config hook): it patches the *libdeps copy* of WebSockets.h to select
+  `WsTlsClient` under `SENSMOS_USE_TLS`, injecting the header by absolute path (deliberately not
+  `-Isrc` — `src/` carries `WiFi.h`/`HTTPClient.h` compat shims that would shadow library
+  headers in every TU).
+* **`WsTlsClient` details that matter:** all I/O rides the virtual `Client` interface (verified
+  against the core headers); WiFiClient's zero-copy peek-buffer API is overridden OFF (it reads
+  raw lwIP pbufs = ciphertext); BearSSL-named config calls (`setInsecure` — called twice by the
+  library — `setFingerprint`, `setTrustAnchors`, `setClientRSACert`) are no-op stubs; the base
+  `WiFiClient` IS the raw TCP socket, so the library's non-virtual `setNoDelay`/`setTimeout`
+  land on the correct socket. One trap found live: `WiFiClient::connect(host,…)` resolves DNS
+  and then calls the *virtual* `connect(IPAddress,…)` — a subclass override that routes back
+  through the host path recurses infinitely; `WsTlsClient` resolves DNS itself and enters the
+  base class only via qualified (non-virtual) calls.
+* **WANT_READ retry fixed** (the known gap at the old ws_tls.cpp:128): the recv callback now
+  returns `WANT_READ` immediately (no 5 s blocking spin — a persistent transport cannot stall
+  `loop()`), and `wolfSSL_connect` runs in a bounded retry loop (30 s deadline, `delay(5)` +
+  `yield()` per iteration, feeding both WDTs). Steady-state reads are fully non-blocking; record
+  reassembly state lives in the wolfSSL session across `WANT_READ` returns.
+* **Live results (COM12, real backend):** TLS handshake ~2.0-2.2 s negotiating
+  **TLSv1.3 / TLS_AES_128_GCM_SHA256** (first on-device TLS 1.3 — the httpbin PoC negotiated
+  1.2), WS upgrade + `identified+enc` (45 native entities) over TLS, geolocation push, checknet
+  worker passes, heartbeat ping/pong sustained. **300 s stability run: zero reconnects, heap
+  flat at 12 k free (min 9-10 k, all heap gates clear), fragmentation flat 15 %, IRAM second
+  heap untouched.** Resident TLS session cost ≈ 2.9 KB DRAM vs the plaintext build (15 k → 12 k
+  steady), exactly the PoC's measured session footprint. App-layer `ws_enc` (ECDH + AES-128-GCM)
+  runs unchanged on top — TLS is transport-layer, independent of it.
+* Certificate verification remains `WOLFSSL_VERIFY_NONE` (PoC posture) — pinning the backend
+  cert is the production follow-up.
+
+Historical build/bring-up findings (static-RAM shrink, rodata relocation, err −326, SP math)
+below — all still accurate for the underlying wolfSSL port:
 
 * **wolfSSL's `wolfssl/wolfssl` PlatformIO package (5.7.2) ships its own bundled
   `user_settings.h`, tuned for ESP-IDF/ESP32.** `wolfssl/wolfcrypt/settings.h` auto-defines

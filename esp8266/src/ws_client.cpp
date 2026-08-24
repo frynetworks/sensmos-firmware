@@ -458,10 +458,13 @@ void ws_client_init() {
         return;
     }
 
-#if WS_PLAINTEXT
+#if WS_PLAINTEXT && !defined(SENSMOS_USE_TLS)
     secure = false;               // WS bez TLS → ~70KB heapu więcej (dane i tak podpisane)
     port   = WS_PLAINTEXT_PORT;   // ws://host:80/v1/ws (nginx → :3000). Fetch/HTTP zostają https.
 #endif
+    // Env TLS (SENSMOS_USE_TLS): powyższy downgrade wyłączony — parseUrl z https backend_url
+    // daje secure=true/port 443, beginSSL() dostaje wolfSSL-owy WsTlsClient (patrz ws_tls.h
+    // + tools/patch_websockets_tls.py). ws_enc (szyfrowanie aplikacyjne) działa bez zmian.
 
     LOGI("ws", "connecting %s://%s:%d%s", secure ? "wss" : "ws", host, port, path);
     if (secure) ws.beginSSL(host, port, path);
