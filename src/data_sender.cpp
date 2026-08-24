@@ -98,6 +98,7 @@ void data_sender_on_net_result(const NetResult& nr) {
 // ── Budowa entities[]/user_data{} z buforów ───────────────────
 static void build_entity_payload(JsonDocument& doc, int& pub_count, int& user_count) {
     entity_own_prune(OWN_TTL_S);   // zdejmij wiszące own.* zanim zbudujemy batch
+    entity_pub_prune(PUB_TTL_S);   // to samo dla pub.* — martwa encja zwalnia slot
     pub_count = user_count = 0;
     int count = entity_count();
     if (count == 0) return;
@@ -282,7 +283,8 @@ void data_sender_update_basics() {
 void data_sender_tick() {
     update_wifi_scan();
     unsigned long now = millis();
-    // K3: periodyczny ping z nonce (heartbeat) — rotuje nonce u BE, ogranicza okno replay.
+    // Periodyczny ping (heartbeat). Anty-replay daje sekwencyjny licznik seq ramki enc
+    // (ws_enc), nie żaden nonce — ping niesie tylko heap + metryki wora.
     // Po pingu (świeży busy% z net_worker_stats) jedna linia [health].
     // Jedna ramka na iterację loop (wczesne return) — nie zalewaj WS trzema naraz.
     if (now - g_last_ping >= 60000UL) { g_last_ping = now; data_sender_send_ping(); log_health(); return; }

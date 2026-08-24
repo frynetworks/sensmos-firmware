@@ -20,13 +20,16 @@
 #include "tunnel.h"
 #include "lora_scan.h"
 #include "pairing.h"
+#include "ext_auth.h"
 #include "ntp_time.h"   // okno świeżości dowodu przy tun_open
 #include "fw_digest.h"
 #include "data_sender.h"
 #include "ws_enc.h"
+#include "net_worker.h"   // WS-watchdog: sonda TCP jedzie na worze (istniejący cn_probe_tcp)
 #include "log.h"
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
+#include <Preferences.h>   // WD: epizod awarii przezywa restart (dowod dla ISP-down)
 #include <esp_random.h>
 
 static WebSocketsClient ws;
@@ -43,6 +46,61 @@ static uint8_t s_fw_nonce[16] = {0};
 // ⚠️ INWARIANT: handle_message MUSI zostać na `const char*`. Gdyby przyjął zapisywalny `char*` (zero-copy),
 // doc aliasowałby ten bufor i TX z handlera by go zepsuł w trakcie dispatchu. Rozmiar = max tasks_update.
 static uint8_t s_enc[TX_SCRATCH_LEN + 32];
+
+// ── WS-watchdog (KNOWN-ISSUES #7; progi w config.h) ───────────────────────────
+// Zawieszka do wyleczenia: WiFi żywe, klient WS martwy i nie próbuje (stan po blipie
+// serwera — 1 node z 263; restart czyści lwIP/DNS/sockety/stan biblioteki). Sonda TCP
+// na endpoint WS rusza OD RAZU po padzie (kadencja: karencja→20 s, potem 60 s).
+// Restart „zawieszka" = sonda przechodzi, a WS leży nieprzerwanie >= WS_WD_GRACE_MS
+// (karencja chroni flotę przed zbiorowym restartem przy każdym deployu BE — deploy
+// zrywa WS na 10-30 s przy żywym nginx). Restart profilaktyczny = WS i TCP martwe
+// nieprzerwanie WS_WD_PROPH_MS. Checknet tu nie pomoże — jego cykl zaczyna się od
+// check_assign PO WS, więc po padzie WS milknie razem z nim; sonda WD jest niezależna.
+static char          s_wd_host[64]    = {0};   // cel sondy = dokładnie endpoint WS (z init)
+static int           s_wd_port        = 0;
+static unsigned long s_wd_down_since  = 0;     // start ciągłego stanu „WS martwy + WiFi żywe"; 0 = nie liczę
+static unsigned long s_wd_next_probe  = 0;
+static bool          s_wd_inflight    = false;
+
+// Epizod awarii — surowiec pod „ISP down detect" (historia zaników per gospodarstwo,
+// podstawa do reklamacji u operatora). Stemple ABSOLUTNE (epoch): w chwili padu WS zegar
+// jest wiarygodny (zsynchronizowany w sesji, która właśnie padła, tyka dalej na millis),
+// więc start epizodu i 1. nieudaną sondę zapisujemy jako epoch — restarty WD ani nawet
+// zanik zasilania go nie psują (NVS; jeden zapis na restart, kasowany po raporcie).
+// Okno net-down wyznaczają NIEUDANE sondy TCP.
+struct WdEp { uint32_t start_epoch; uint32_t ff_epoch; uint16_t fails; uint16_t oks; uint8_t restarts; };
+static WdEp          s_wd_prev        = {0,0,0,0,0};  // stan sprzed restartów (z NVS)
+static unsigned long s_wd_first_fail  = 0;            // millis 1. nieudanej sondy w TYM bootcie
+static uint16_t      s_wd_fail_cnt    = 0;
+static uint16_t      s_wd_ok_cnt      = 0;
+
+// Konwersja chwili millis → epoch. 0 gdy zegar nieznany (zimny boot bez syncu) —
+// wtedy stempel zostaje pusty, a prev z NVS (jeśli jest) i tak niesie prawdziwy start.
+static uint32_t ws_wd_epoch_at(unsigned long t_ms) {
+    uint32_t e = ws_epoch_now();
+    if (!e || !t_ms) return 0;
+    return e - (uint32_t)((millis() - t_ms) / 1000UL);
+}
+
+static void ws_wd_persist_episode() {
+    WdEp ep = s_wd_prev;
+    if (!ep.start_epoch) ep.start_epoch = ws_wd_epoch_at(s_wd_down_since);
+    if (!ep.ff_epoch)    ep.ff_epoch    = ws_wd_epoch_at(s_wd_first_fail);
+    ep.fails    += s_wd_fail_cnt;
+    ep.oks      += s_wd_ok_cnt;
+    ep.restarts += 1;
+    Preferences p; p.begin("sensmos", false);
+    p.putBytes("wd_ep", &ep, sizeof(ep));
+    p.end();
+}
+
+static void ws_wd_restart(const char* why) {
+    LOGW("ws", "watchdog: %s -> restart", why);
+    node_log_push("error", why, false);   // ślad w GET /node/log widoczny po powrocie
+    ws_wd_persist_episode();              // epizod nie może zginąć z restartem — to dowód
+    delay(200);
+    ESP.restart();
+}
 
 // ── Parsowanie URL ─────────────────────────────────────────────
 static bool parseUrl(const char* url, char* host, int* port, char* path_out, bool* secure) {
@@ -195,6 +253,39 @@ static void on_identified(JsonDocument& doc) {
 
     g_ws_connected = true;
     node_integration_push("ws_connected", "{}");
+
+    // Raport epizodu awarii (WD): stemple ABSOLUTNE. Zegar właśnie zsynchronizowany
+    // (server_time wyżej), więc nawet epizod bez restartów dostaje dokładny start_epoch
+    // z konwersji millis. Po restartach/zaniku zasilania prawdziwy start niesie NVS.
+    // Blipy <60 s (deploy BE) pomijamy. Wysyłka po identify = kanał już żywy.
+    {
+        uint32_t start_e = s_wd_prev.start_epoch ? s_wd_prev.start_epoch
+                                                 : ws_wd_epoch_at(s_wd_down_since);
+        uint32_t ff_e    = s_wd_prev.ff_epoch    ? s_wd_prev.ff_epoch
+                                                 : ws_wd_epoch_at(s_wd_first_fail);
+        uint32_t now_e   = ws_epoch_now();
+        if (start_e && now_e > start_e && now_e - start_e >= 60) {
+            char rep[192];
+            snprintf(rep, sizeof(rep),
+                "{\"type\":\"ws_outage\",\"start_epoch\":%lu,\"ff_epoch\":%lu,"
+                "\"probes_fail\":%u,\"probes_ok\":%u,\"restarts\":%u}",
+                (unsigned long)start_e, (unsigned long)ff_e,
+                (unsigned)(s_wd_prev.fails + s_wd_fail_cnt),
+                (unsigned)(s_wd_prev.oks + s_wd_ok_cnt),
+                (unsigned)s_wd_prev.restarts);
+            ws_client_send_raw(rep);
+            LOGI("ws", "wd: outage reported (start=%lu, %lus, restarts=%u)",
+                 (unsigned long)start_e, (unsigned long)(now_e - start_e),
+                 (unsigned)s_wd_prev.restarts);
+        }
+        // Epizod zamknięty — czyścimy stan i NVS (jeśli był zapis sprzed restartu).
+        if (s_wd_prev.start_epoch || s_wd_prev.restarts) {
+            Preferences p; p.begin("sensmos", false); p.remove("wd_ep"); p.end();
+        }
+        s_wd_prev = {0,0,0,0,0};
+        s_wd_first_fail = 0;
+        s_wd_fail_cnt = s_wd_ok_cnt = 0;
+    }
 
     // 0.64: udany identify = BE zna device i wpuścił → onboarding potwierdzony.
     // Rozbraja watchdog factory-resetu, gdy apka nie mogła strzelić lokalnego
@@ -352,6 +443,29 @@ static void on_ota(JsonDocument& doc) {
 // wymagany HMAC, a tego bez klucza nie da się przeliczyć.
 #define TUN_OPEN_WINDOW_S 60
 
+// ── Anti-replay: jednorazowość proof w oknie ─────────────────────────────────
+// Sam HMAC + okno 60 s wciąż pozwalają POWTÓRZYĆ ważny proof w tym oknie. Istotne wobec
+// jedynego przeciwnika, przed którym proof w ogóle chroni — skompromitowanego BE: klucza
+// parowania nie zna, ale JEST końcem szyfrowanego kanału (seq go nie zatrzyma, sam tworzy
+// ramki) i widzi proof, bo go przepycha telefon→node. Domykamy to jednorazowością: node
+// pamięta proofy przyjęte w oknie i odrzuca powtórki. Ten sam wzorzec co claimCode() w BE.
+#define TUN_PROOF_SLOTS 16
+static struct { uint8_t p[32]; uint32_t at; } s_tun_seen[TUN_PROOF_SLOTS];
+
+// true = proof już przyjęty w oknie (replay); false = świeży (zajmuje slot).
+static bool tun_proof_replay(const uint8_t proof[32], uint32_t now) {
+    int slot = 0; uint32_t oldest = 0xFFFFFFFF;
+    for (int i = 0; i < TUN_PROOF_SLOTS; i++) {
+        bool live = s_tun_seen[i].at && (now - s_tun_seen[i].at <= TUN_OPEN_WINDOW_S);
+        if (live && memcmp(s_tun_seen[i].p, proof, 32) == 0) return true;
+        uint32_t age = live ? s_tun_seen[i].at : 0;   // puste/wygasłe = do nadpisania pierwsze
+        if (age < oldest) { oldest = age; slot = i; }
+    }
+    memcpy(s_tun_seen[slot].p, proof, 32);
+    s_tun_seen[slot].at = now;
+    return false;
+}
+
 static void on_tun_open(JsonDocument& doc) {
     const int   tid  = (int)(doc["tid"] | 0);
     const char* ip   = doc["ip"] | "";
@@ -387,12 +501,25 @@ static void on_tun_open(JsonDocument& doc) {
     snprintf(msg, sizeof(msg), "sensmos-tun-open|%s|%s|%d|%lu",
              g_device_id, ip, port, (unsigned long)ts);
     if (!pairing_verify(msg, proof)) { deny("bad proof"); return; }
+    if (tun_proof_replay(proof, now)) { deny("proof replayed"); return; }
 
     tunnel_on_open(tid, ip, port);
 }
 static void on_tun_data(JsonDocument& doc) {
     tunnel_on_data((int)(doc["tid"] | 0), doc["d"] | "");
 }
+// Przystawki: odpowiedź BE na ext_auth_req. Guard jest tu obowiązkowy — ramka niesie
+// TOKEN, więc plaintext oznaczałby, że rogue-AP wydaje uprawnienia w naszym imieniu.
+static void on_ext_auth_grant(JsonDocument& doc) {
+    if (!cmd_enc_guard("ext_auth_grant")) return;
+    ext_auth_on_grant(doc["req"] | "", doc["id"] | "", doc["token"] | "",
+                      (uint32_t)(doc["exp"] | 0));
+}
+static void on_ext_auth_deny(JsonDocument& doc) {
+    if (!cmd_enc_guard("ext_auth_deny")) return;
+    ext_auth_on_deny(doc["req"] | "", doc["reason"] | "denied");
+}
+
 static void on_tun_close(JsonDocument& doc) {
     tunnel_on_close((int)(doc["tid"] | 0));
 }
@@ -431,10 +558,26 @@ static void on_lora_cfg(JsonDocument& doc) {
         }
         n++;
     }
+    // Sekret do kodu w beaconie — 32 hex. Stary BE tego pola nie przysyla, a nod bez seeda
+    // nadaje beacon bez kodu: nikt nie potwierdzi, ze go slyszal, ale nic sie nie psuje.
+    uint8_t seed[16];
+    bool has_seed = false;
+    const char* sd = doc["seed"] | "";
+    if (strlen(sd) == 32) {
+        has_seed = true;
+        for (int i = 0; i < 16 && has_seed; i++) {
+            char hx[3] = { sd[i * 2], sd[i * 2 + 1], 0 };
+            char* end = nullptr;
+            seed[i] = (uint8_t)strtoul(hx, &end, 16);
+            if (end != hx + 2) has_seed = false;             // nie-hex w seedzie = seeda nie ma
+        }
+    }
+
     JsonObject b = doc["beacon"];
     lora_link_set((bool)(doc["on"] | false), (bool)(b["on"] | false),
                   (uint8_t)(b["slot"] | 0), (uint16_t)(b["every_s"] | 60),
-                  (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n);
+                  (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n,
+                  has_seed ? seed : nullptr);
 }
 
 // Skan całego pasma na żądanie BE. Przerywa nasłuch na kilka sekund, po czym tryb link
@@ -500,6 +643,8 @@ static const WsEntry WS_TABLE[] = {
     { "tun_data",          on_tun_data },
     { "tun_close",         on_tun_close },
     { "fw_digest",         fw_digest_on_ws },
+    { "ext_auth_grant",    on_ext_auth_grant },
+    { "ext_auth_deny",     on_ext_auth_deny },
 #if LORA_ENABLED
     { "lora_cfg",          on_lora_cfg },
     { "lora_scan",         on_lora_scan },
@@ -589,6 +734,15 @@ void ws_client_init() {
     port   = WS_PLAINTEXT_PORT;   // ws://host:80/v1/ws (nginx → :3000). Fetch/HTTP zostają https.
 #endif
 
+    // WS-watchdog: sonda celuje w DOKŁADNIE ten sam endpoint co klient WS.
+    strlcpy(s_wd_host, host, sizeof(s_wd_host));
+    s_wd_port = port;
+    // Epizod sprzed restartu (jeśli WD restartował) — doliczymy go do raportu po identify.
+    { Preferences p; p.begin("sensmos", true);
+      if (p.getBytes("wd_ep", &s_wd_prev, sizeof(s_wd_prev)) != sizeof(s_wd_prev))
+          s_wd_prev = {0,0,0,0,0};
+      p.end(); }
+
     LOGI("ws", "connecting %s://%s:%d%s", secure ? "wss" : "ws", host, port, path);
     if (secure) ws.beginSSL(host, port, path);
     else        ws.begin(host, port, path);
@@ -628,4 +782,57 @@ bool ws_client_send_raw(const char* json_msg) {
 }
 
 bool ws_client_connected() { return g_ws_connected; }
-void ws_client_tick()      { ws.loop(); }
+
+// Kadencja sondy: w oknie karencji gęsto (szybka diagnoza), potem oszczędnie.
+static unsigned long ws_wd_cadence(unsigned long now) {
+    return (now - s_wd_down_since < WS_WD_GRACE_MS) ? WS_WD_PROBE_FAST_MS : WS_WD_PROBE_MS;
+}
+
+// Wynik sondy TCP z wora (dispatch w .ino po nr.src == NW_WSWD).
+void ws_client_wd_on_net_result(const NetResult& nr) {
+    s_wd_inflight = false;
+    if (!s_wd_down_since || g_ws_connected) return;              // WS wrócił zanim sonda doszła
+    unsigned long now = millis();
+    if (!nr.deferred) {
+        if (nr.res.ok) s_wd_ok_cnt++;
+        else {   // nieudane sondy wyznaczają okno „internet leżał" (dowód pod ISP-down)
+            s_wd_fail_cnt++;
+            if (!s_wd_first_fail) s_wd_first_fail = now ? now : 1;
+        }
+    }
+    // TCP przechodzi + WS martwy nieprzerwanie >= karencja → zawieszka klienta, restart.
+    // W oknie karencji udana sonda NIE restartuje (normalny reconnect po deployu BE).
+    if (!nr.deferred && nr.res.ok && now - s_wd_down_since >= WS_WD_GRACE_MS)
+        ws_wd_restart("ws-wd: net OK, WS dead");
+    s_wd_next_probe = now + ws_wd_cadence(now);
+}
+
+void ws_client_tick() {
+    ws.loop();
+
+    if (g_ws_connected || WiFi.status() != WL_CONNECTED) {
+        s_wd_down_since = 0;   // WiFi-down leczy wifi_maintain (własny reboot) — tu nie liczymy
+        return;
+    }
+    unsigned long now = millis();
+    if (!s_wd_down_since) {
+        s_wd_down_since = now ? now : 1;   // 0 to sentinel „nie liczę"
+        s_wd_next_probe = now;             // sonda od razu, bez czekania
+        return;
+    }
+    // Restart profilaktyczny: WS i TCP martwe nieprzerwanie 2h (gdyby TCP w międzyczasie
+    // przeszło, restart „zawieszka" zapadłby już po karencji — tu trafiamy tylko przy
+    // ciągłym braku internetu albo zawieszce, która kładzie też sondę).
+    if (now - s_wd_down_since >= WS_WD_PROPH_MS)
+        ws_wd_restart("ws-wd: prophylactic (ws+net down)");
+    if (s_wd_inflight || (long)(now - s_wd_next_probe) < 0) return;
+
+    NetJob nj{};
+    nj.src = NW_WSWD;
+    strlcpy(nj.job.kind, "tcp", sizeof(nj.job.kind));
+    strlcpy(nj.job.host, s_wd_host, sizeof(nj.job.host));
+    nj.job.port       = s_wd_port;
+    nj.job.timeout_ms = 4000;
+    if (net_worker_enqueue(nj, false)) s_wd_inflight = true;
+    else s_wd_next_probe = now + ws_wd_cadence(now);   // wór pełny — spróbuj wg kadencji
+}

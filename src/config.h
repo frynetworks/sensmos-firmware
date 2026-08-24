@@ -21,7 +21,11 @@
 #define ENTITY_PUB_MAX       16   // telemetria NET poszla do mon[] (mon-split), wiec pub[] znowu ma zapas:
                                   // realny node ma max 9 sensorow nie-NET. 40 przekraczalo TX_SCRATCH_LEN
                                   // (~3365B > 3072) = CICHY drop calego batcha.
-#define ENTITY_MON_MAX       12   // telemetria NET (mon.*) — zamkniety zbior 11 encji, 12 = zapas
+// 12 -> 18: doszlo 5 encji radiowych (mon.lora_*, kategoria RF w BE). Przy 12 slotach
+// i 11 encjach NET zapas byl jeden, wiec entity_push wypychal NAJSTARSZY wpis — a NET
+// jest zapisywany co batch, LoRa raz na 5 min, wiec to zawsze radiowe wylatywalo tuz
+// przed wyslaniem paczki. Efekt: kategoria RF istniala w BE i nigdy nie dostawala danych.
+#define ENTITY_MON_MAX       18   // 11 NET + 5 RF + 2 zapasu
 #define ENTITY_OWN_MAX       16
 #define ENTITY_TMP_MAX        8
 #define ENTITY_POOL_MAX      16   // sub.* — bylo 64 (7.4KB); 16 starcza, heap dla TLS/monitorow
@@ -29,6 +33,15 @@
 // own.* nieodświeżone przez ten czas są usuwane z bufora (anty „wiszące" encje).
 // Musi być > cyklu odświeżania źródła (HA pushuje ~5 min). 0 = wyłączone.
 #define OWN_TTL_S          1800
+// Encja pub.* nieodswiezona przez dobe wypada z tablicy. Do 2026-08-18 pub[] NIE MIAL
+// zadnego wygasania: wartosc wpisana raz (np. 222 V z odlaczonej integracji HA) jechala
+// w KAZDYM batchu w nieskonczonosc i trzymala slot. Przy 16 slotach kilka przestawien
+// integracji wypelnia tablice trupami, ktore zaczynaja wypychac zywe encje — dokladnie ten
+// mechanizm zjadl encje LoRa w mon[12].
+//
+// Nie skraca okna nagrody: BE liczy swiezosc z last_updated (wieku odczytu), wiec
+// przyciecie tu niczego nie zmienia w rozliczeniu — tylko przestaje wysylac martwe dane.
+#define PUB_TTL_S          86400
 
 // ── Message router ────────────────────────────────────────────
 #define MAX_MESSAGE_SLOTS     3
@@ -42,10 +55,24 @@
 
 // ── WebSocket ─────────────────────────────────────────────────
 // WS plaintext (ws://host:80/v1/ws) — trwały TLS zjadałby ~70KB heapu, a ESP32 tego nie ma.
-// Dane i tak podpisane kryptograficznie (integralność niezależna od TLS). HTTP/fetch zostają
+// Dane i tak uwierzytelnione kryptograficznie (WS enc: AES-GCM + seq, integralność niezależna od TLS). HTTP/fetch zostają
 // po https (połączenia chwilowe — alokują TLS tylko na czas i zwalniają). 0 = wss jak z backend_url.
 #define WS_PLAINTEXT          1
 #define WS_PLAINTEXT_PORT     80
+
+// ── WS-watchdog (KNOWN-ISSUES #7; spec usera 2026-08-22) ──────
+// Po restarcie nginxa na VPS 1 node z 263 zaklinował się w stanie „WiFi stoi, WS martwy,
+// zero prób" i wisiał godzinami. Przebieg: WS pada przy żywym WiFi → sonda TCP na endpoint
+// WS rusza OD RAZU (pierwsze 5 min co 20 s, potem co 60 s). Restart „zawieszka": sonda
+// przechodzi, a WS leży nieprzerwanie >= WS_WD_GRACE_MS — karencja jest konieczna, bo
+// każdy deploy BE zrywa WS całej flocie na 10-30 s przy żywym nginx (TCP OK); bez niej
+// deploy równałby się restartowi 263 nodów naraz. Restart PROFILAKTYCZNY: WS i TCP martwe
+// nieprzerwanie WS_WD_PROPH_MS (długa awaria internetu = cykl co ~2h — świadoma decyzja;
+// zgłoszenie zaniku WS ramką LoRa dojdzie osobno: plan lora emergency beacon).
+#define WS_WD_PROBE_FAST_MS  (20UL * 1000)           // kadencja sondy w oknie karencji
+#define WS_WD_PROBE_MS       (60UL * 1000)           // kadencja sondy po karencji
+#define WS_WD_GRACE_MS       (5UL * 60 * 1000)       // TCP OK + WS martwy >= tyle → restart
+#define WS_WD_PROPH_MS       (2UL * 60 * 60 * 1000)  // WS+TCP leżą tak długo → restart profilaktyczny
 
 // ── HTTP server (node) ────────────────────────────────────────
 #define INBOX_SIZE            6
@@ -127,4 +154,5 @@
 // ── OTA (v0.35+) ──────────────────────────────────────────────
 #define OTA_CONFIRM_TIMEOUT_MS  300000UL  // brak WS w 5 min po aktualizacji -> rollback na stary slot
 
-// traceroute last-hop robi teraz BE (serwerowy, peer_probes) — node nie dotyka raw-socketu.
+// traceroute: node robi autonomiczny trace do głuchych peerów przez statyczny raw ICMP pcb
+// (LWIP), wołany z checknet i net_worker; BE robi komplementarny trace od siebie (peer_probes).

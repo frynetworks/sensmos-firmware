@@ -3,6 +3,7 @@
 #include "src/ota.h"
 #include "src/wifi_manager.h"
 #include "src/http_server.h"
+#include "src/ext_auth.h"
 #include "src/node_integration.h"
 #include "src/entity_store.h"
 #include "src/message_router.h"
@@ -212,10 +213,15 @@ void loop() {
             else if (nr.src == NW_PUNCH)    punch_on_net_result(nr);
             else if (nr.src == NW_CHECKNOW) checknow_on_net_result(nr);
             else if (nr.src == NW_INTEGRATION) node_integration_on_result(nr);
+            else if (nr.src == NW_WSWD)     ws_client_wd_on_net_result(nr);
             else                            data_sender_on_net_result(nr);
         }
     }
     if (g_ble_active) ble_tick();
+#if LORA_ENABLED
+    lora_pump();         // skrzynka taska radiowego — wysyłka MUSI iść z loop, nie z core 0
+#endif
+    ext_auth_tick();     // przystawki — timeout ceremonii i sprzątanie wydanego tokenu
     ota_tick();
     delay(10);
 }
