@@ -115,9 +115,12 @@ union PortalBuf {
 static PortalBuf* s_buf_p = nullptr;
 #define s_buf (*s_buf_p)
 
-// Cache skanu WiFi (zebrany PRZED softAP — skan w trybie AP bywa zawodny)
+// Cache skanu WiFi (zebrany PRZED softAP — skan w trybie AP bywa zawodny).
+// Lazy-calloc w ble_start() (−432B .bss) — zarejestrowany node nigdy nie wchodzi w portal,
+// więc nie płaci ani .bss, ani heapu. Nigdy nie zwalniany (portal kończy się ESP.restart()).
 #define SCAN_MAX 12
-static struct { char ssid[33]; int16_t rssi; } s_scan[SCAN_MAX];
+struct ScanEnt { char ssid[33]; int16_t rssi; };
+static ScanEnt* s_scan = nullptr;
 static int s_scan_n = 0;
 
 // Rate limiter (1:1 z BLE)
@@ -551,7 +554,8 @@ void ble_start() {
 
     if (!s_buf_p)      s_buf_p      = (PortalBuf*)calloc(1, sizeof(PortalBuf));
     if (!s_rounds_buf) s_rounds_buf = (char*)calloc(1, ROUNDS_BUF_LEN);
-    if (!s_buf_p || !s_rounds_buf) { LOGE("portal", "buf alloc failed"); return; }
+    if (!s_scan)       s_scan       = (ScanEnt*)calloc(SCAN_MAX, sizeof(ScanEnt));
+    if (!s_buf_p || !s_rounds_buf || !s_scan) { LOGE("portal", "buf alloc failed"); return; }
 
     // Pre-scan w STA ZANIM wstanie AP (skan w trybie AP bywa zawodny) → cache do pickera
     WiFi.mode(WIFI_STA);

@@ -10,6 +10,7 @@
 #include "monitors.h"
 #include "net_worker.h"
 #include "checknet.h"
+#include "data_sender.h"   // g_tx_scratch (współdzielony bufor TX loop-only)
 #include "config.h"
 #include "log.h"
 #include "ws_client.h"
@@ -127,7 +128,9 @@ static void mon_send_rollup(int i) {
 // Wpis: [id, state(-1/0/1), age_s(-1 = jeszcze bez sondy)].
 static unsigned long g_status_at = 0;    // 0 = nieaktywny (żadnego seta jeszcze nie było)
 static void mon_send_status() {
-    static char buf[576];
+    // Współdzielony g_tx_scratch zamiast własnego static (−576B .bss) — bezpieczne jak w
+    // punch.cpp/tunnel.cpp: loop-only, build-and-send w jednym wywołaniu, zero retencji.
+    char (&buf)[TX_SCRATCH_LEN] = g_tx_scratch;
     int n = snprintf_P(buf, sizeof(buf), PSTR("{\"type\":\"monitor_status\",\"m\":["));
     bool any = false;
     for (int i = 0; i < MONITORS_MAX_SLOTS; i++) {

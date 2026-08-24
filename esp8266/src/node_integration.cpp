@@ -16,24 +16,41 @@ struct NiEvent {
 };
 
 static String    _url = "";
-static NiEvent   _queue[NI_QUEUE_SIZE];
+// 0.73: batch idzie na wór. batch trzyma ciało POST między enqueue a wykonaniem na worze
+// (jeden job w locie — _inflight). 768B (8266; bylo 1280 na ESP32) pokrywa 3 zdarzenia
+// × (action24+payload128) + narzut JSON.
+// Kolejka+batch w lazy-calloc NiState (−1,227B .bss): alokacja RAZ w init/set_url gdy URL
+// skonfigurowany (okno bootu, sterta ciągła — celowo NIE przy pierwszym push, który wypada
+// w dołku heapu po ws_connected). NIGDY nie zwalniany — set_url("") w runtime nie może
+// unieważnić batcha, bo zakolejkowany whook job czyta go później przez
+// node_integration_wor_body() (net_worker.cpp). Nieskonfigurowany node nie płaci nic —
+// spójne z intencją heap-contiguity z entity_store.cpp.
+struct NiState {
+    NiEvent queue[NI_QUEUE_SIZE];
+    char    batch[768];
+};
+static NiState*  _st = nullptr;
 static int       _q_head = 0;
 static int       _q_tail = 0;
 static int       _q_count = 0;
 static unsigned long _last_flush_ms = 0;
-
-// 0.73: batch idzie na wór. _batch trzyma ciało POST między enqueue a wykonaniem na worze
-// (jeden job w locie — _inflight). 1280B pokrywa 6 zdarzeń × (action24+payload128) + narzut JSON.
-static char _batch[768];   // 8266: bylo 1280 (ESP32)
 static bool _inflight = false;
+
+static bool ni_ensure() {
+    if (_st) return true;
+    _st = (NiState*)calloc(1, sizeof(NiState));
+    if (!_st) LOGW("ni", "state alloc failed — event dropped");
+    return _st != nullptr;
+}
 
 void node_integration_init() {
     Preferences p; p.begin("ni", true);
     _url = p.getString("url", "");
     p.end();
-    memset(_queue, 0, sizeof(_queue));
-    if (_url.length() > 0)
+    if (_url.length() > 0) {
+        ni_ensure();   // alokacja w oknie bootu (calloc zeruje — memset zbędny)
         LOGI("ni", "integration URL: %s", _url.c_str());
+    }
 }
 
 void node_integration_set_url(const char* url) {
@@ -41,6 +58,7 @@ void node_integration_set_url(const char* url) {
     Preferences p; p.begin("ni", false);
     p.putString("url", _url);
     p.end();
+    if (_url.length() > 0) ni_ensure();
     LOGI("ni", "integration URL set: %s", url);
 }
 
@@ -48,13 +66,14 @@ String node_integration_get_url() { return _url; }
 
 void node_integration_push(const char* action, const char* payload_json) {
     if (_url.length() == 0) return;  // nie skonfigurowany — skip
+    if (!ni_ensure()) return;        // brak stanu (alloc fail) — drop, retry przy następnym evencie
     if (_q_count >= NI_QUEUE_SIZE) {
         // Kolejka pełna — nadpisz najstarszy
         LOGD("ni", "queue full — dropping oldest");
         _q_tail = (_q_tail + 1) % NI_QUEUE_SIZE;
         _q_count--;
     }
-    NiEvent& e = _queue[_q_head];
+    NiEvent& e = _st->queue[_q_head];
     strncpy(e.action,  action,       sizeof(e.action)  - 1);
     strncpy(e.payload, payload_json, sizeof(e.payload) - 1);
     e.pending = true;
@@ -71,7 +90,7 @@ static int build_batch() {
     JsonArray evs = doc["events"].to<JsonArray>();
     int idx = _q_tail, n = 0;
     for (int i = 0; i < _q_count; i++) {
-        NiEvent& e = _queue[idx];
+        NiEvent& e = _st->queue[idx];
         if (e.pending) {
             JsonObject o = evs.add<JsonObject>();
             o["action"] = e.action;
@@ -84,8 +103,8 @@ static int build_batch() {
         }
         idx = (idx + 1) % NI_QUEUE_SIZE;
     }
-    size_t len = serializeJson(doc, _batch, sizeof(_batch));
-    if (len == 0 || len >= sizeof(_batch)) { _batch[0] = 0; return -1; }  // overflow — nie wysyłaj śmieci
+    size_t len = serializeJson(doc, _st->batch, sizeof(_st->batch));
+    if (len == 0 || len >= sizeof(_st->batch)) { _st->batch[0] = 0; return -1; }  // overflow — nie wysyłaj śmieci
     return n;
 }
 
@@ -93,6 +112,7 @@ void node_integration_update() {
     if (_inflight)              return;   // poprzedni batch nadal na worze
     if (_q_count == 0)          return;
     if (_url.length() == 0)     return;
+    if (!_st)                   return;   // stan niezaalokowany (alloc fail) — nic do wysłania
     if (WiFi.status() != WL_CONNECTED) return;
     unsigned long now = millis();
     if (now - _last_flush_ms < NI_FLUSH_INTERVAL_MS) return;
@@ -110,7 +130,7 @@ void node_integration_update() {
     if (net_worker_enqueue(nj, false)) {
         // sukces — usuń zbatchowane zdarzenia z kolejki (drenaż FIFO)
         for (int i = 0; i < n && _q_count > 0; ) {
-            if (_queue[_q_tail].pending) { _queue[_q_tail].pending = false; i++; }
+            if (_st->queue[_q_tail].pending) { _st->queue[_q_tail].pending = false; i++; }
             _q_tail = (_q_tail + 1) % NI_QUEUE_SIZE;
             _q_count--;
         }
@@ -121,7 +141,9 @@ void node_integration_update() {
     }
 }
 
-const char* node_integration_wor_body() { return _batch; }
+// Null-guard obowiązkowy: wywoływane z net_worker.cpp BEZ bramki _url (job whook może
+// teoretycznie przeżyć wyczyszczenie configu) — pusty string zamiast deref nullptr.
+const char* node_integration_wor_body() { return _st ? _st->batch : ""; }
 
 void node_integration_on_result(const NetResult& nr) {
     _inflight = false;

@@ -38,16 +38,24 @@ static bool     g_tr_launched = false;   // max 1 autonomiczny trace / cykl
 static char     g_tr_lh_host[80] = "";   // rDNS last-hopa (z workera) — do geo_ok + raportu
 // Cooldown trace (rolling): swiezo trace'owany cel nie jest re-trace'owany przez
 // TRACE_COOLDOWN_MS — martwy peer wracajacy w jobach co cykl nie mloci traceroutem.
-static struct { char host[46]; unsigned long until; } g_tr_cd[TRACE_COOLDOWN_SLOTS];
+// Host jako hash FNV-1a-32 zamiast char[46] (−440B .bss): host tu nigdy nie jest drukowany,
+// tylko porównywany. Kolizja = jeden autonomiczny trace pominięty ≤TRACE_COOLDOWN_MS (diag).
+static uint32_t tr_cd_hash(const char* s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h ? h : 1u;   // 0 zarezerwowane = pusty slot
+}
+static struct { uint32_t h; unsigned long until; } g_tr_cd[TRACE_COOLDOWN_SLOTS];
 static int g_tr_cd_idx = 0;
 static bool tr_cd_ok(const char* host) {
+    uint32_t hh = tr_cd_hash(host);
     for (int i = 0; i < TRACE_COOLDOWN_SLOTS; i++)
-        if (g_tr_cd[i].host[0] && !strcmp(g_tr_cd[i].host, host) && (long)(g_tr_cd[i].until - millis()) > 0)
+        if (g_tr_cd[i].h == hh && (long)(g_tr_cd[i].until - millis()) > 0)
             return false;
     return true;
 }
 static void tr_cd_add(const char* host) {
-    strlcpy(g_tr_cd[g_tr_cd_idx].host, host, sizeof(g_tr_cd[0].host));
+    g_tr_cd[g_tr_cd_idx].h = tr_cd_hash(host);
     g_tr_cd[g_tr_cd_idx].until = millis() + TRACE_COOLDOWN_MS;
     g_tr_cd_idx = (g_tr_cd_idx + 1) % TRACE_COOLDOWN_SLOTS;
 }

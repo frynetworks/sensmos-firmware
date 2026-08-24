@@ -239,7 +239,7 @@ identity during the handshake, and optionally pin a hash of the backend's TLS ce
 for out-of-band checks. Cost: ~32–64 B. Adds server authentication with no TLS stack at all.
 Missing: record-layer protection and protocol negotiation.
 
-**Option 3 — wolfSSL — PoC built and measured; does not fit this firmware's budget.**
+**Option 3 — wolfSSL — PoC built, linked, flashed, and measured on-device (2026-08-24); fits after static-RAM shrink + rodata relocation.**
 A working proof-of-concept now exists (`ws_tls.cpp`/`ws_tls.h`, gated behind the
 `SENSMOS_USE_TLS` build flag, isolated to its own `nodemcuv2_tls` PlatformIO environment so the
 shipping `nodemcuv2` build carries zero TLS code — confirmed byte-identical RAM/Flash usage with
@@ -261,37 +261,63 @@ wolfSSL's published numbers:
   own test/benchmark harnesses reference ESP-IDF-only `ESP_LOGE`/`sdkconfig.h` and don't apply
   here) and satisfying TLS 1.3's real prerequisites (`HAVE_HKDF`, `WC_RSA_PSS`), every wolfSSL
   source file builds without error against the ESP8266 Arduino toolchain.
-* **It does not link.** Even in a maximally trimmed configuration — `NO_SESSION_CACHE`, a single
-  ECC curve (`ECC_USER_CURVES` + `HAVE_ECC256` only), `RSA_LOW_MEM`, `NO_DH` (removes FFDHE
-  group tables — this firmware only wants ECDHE), single-threaded, small-stack — the final link
-  fails: `.bss` (and, before the above trims, `.rodata` too) overflows the ESP8266's 80 KB
-  `dram0_0_seg` region by **1,488 bytes**, on top of this firmware's existing ~56.7 KB static
-  baseline (69.3 % of 80 KB before wolfSSL is added at all — see Status table). Confirmed
-  reproducible across the final build. Symbol-table evidence
-  (`xtensa-lx106-elf-nm --size-sort` on the built `libwolfssl.a`) shows wolfSSL's own *direct*
-  global `.bss` footprint is trivial (~136 B total: RNG mutex flags and one 80 B scratch buffer)
-  — the overflow is the cumulative cost of linking wolfSSL's code and data into this image, not
-  one dominant static buffer, and swapping wolfSSL's big-number backend
-  (`WOLFSSL_SP_MATH_ALL`/`WOLFSSL_SP_SMALL` in place of the default fast-math) made no measurable
-  difference, ruling out RSA/ECC math tables as the cause.
-* Because the firmware never links, **no on-device runtime heap measurement (handshake spike,
-  steady-state) was obtainable** — the PoC's heap-instrumentation code (`ws_tls_run_poc_test()`,
-  logging `[tls-heap]` readings at init/CTX/connect/handshake/steady-state/cleanup) is in place
-  and ready to run the moment the image fits, but static memory pressure alone is the blocker
-  here, before any dynamic allocation is reached.
+* **It initially did not link.** In the maximally trimmed configuration — `NO_SESSION_CACHE`, a
+  single ECC curve (`ECC_USER_CURVES` + `HAVE_ECC256` only), `RSA_LOW_MEM`, `NO_DH`,
+  single-threaded, small-stack — the link failed: `.bss` overflowed the ESP8266's 80 KB
+  `dram0_0_seg` by **1,488 bytes** on top of this firmware's then ~56.7 KB static baseline.
+  wolfSSL's own *direct* `.bss` is trivial (~136–192 B); the overflow was cumulative image cost.
+  **Resolved (2026-08-24) by freeing 2,664 B of static DRAM in the existing firmware** — four
+  targeted edits, applied to both envs, shipping build improved from 56,736 B to 54,072 B (66.0 %):
+  `monitors.cpp` status snapshot now reuses the shared `g_tx_scratch` TX buffer instead of its own
+  576 B static (same loop-only single-writer pattern as `punch.cpp`/`tunnel.cpp`); `checknet.cpp`
+  traceroute cooldown stores 4-byte FNV-1a host hashes instead of `char[46]` names (−440 B);
+  `captive_portal.cpp` WiFi pre-scan cache became portal-only lazy-calloc (−432 B); and
+  `node_integration.cpp` queue+batch moved into a lazy-calloc'd `NiState` allocated once at
+  init/set_url only when an integration URL is configured (−1,227 B; unconfigured nodes pay
+  nothing, and the buffer is never freed so the in-flight webhook body pointer stays valid).
+* **Linking was necessary but not sufficient: the linked image reset-looped on boot.** With
+  wolfSSL's **~26.1 KB of `.rodata` in DRAM** (this linker script places `.rodata` in
+  `dram0_0_seg`), the TLS image's static footprint was 80,732 B — leaving ~1.2 KB of boot heap.
+  The NONOS SDK OOMs before `setup()` even runs: 72 consecutive `rst cause:2` resets in a 180 s
+  capture with zero readable output. **Fixed by relocating `libwolfssl.a`'s `.rodata` to flash**
+  (`tools/relocate_wolfssl_rodata.py`, a TLS-env-only `post:` extra_script that patches the
+  *generated* `$BUILD_DIR/ld/local.eagle.app.v6.common.ld`, adding
+  `*libwolfssl.a:(.rodata .rodata.* .rodata1)` to the `.irom0.text` collection). Safe because this
+  build's MMU config (`MMU_IRAM_HEAP`, NONOS SDK 2.2.x) already installs the non32xfer exception
+  handler, so 8/16-bit reads from flash work — slowly, which is acceptable for a PoC measurement
+  path. Result: TLS image DRAM static **80,732 → 54,616 B (66.5 %)**, boot heap ≈ 27 KB, on par
+  with the shipping build. The shipping `nodemcuv2` env never loads this script and is untouched.
+* **On-device `[tls-heap]` measurements (nodemcuv2, 160 MHz, WS backend connected after PoC):**
 
-**Conclusion: wolfSSL does not fit this port's ~25 KB total addressable budget as a drop-in TLS
-option, contradicting the earlier documentation-level estimate below this section — that estimate
-assumed IRAM-routing and buffer trimming would be sufficient; on-device, the shortfall is in
-static image size, ~1.5 KB past the hard 80 KB DRAM ceiling, before the runtime heap question
-even arises.** The two paths that could plausibly close a 1.5 KB gap — freeing static RAM
-elsewhere in the existing ~56.7 KB baseline, or moving more of wolfSSL's `.text` into the IRAM
-icache region (trading back some of the 16 KB icache this port already gave up for the second
-heap, see Optimizations above) — are real options for a follow-up, not evaluated here to keep
-this PoC's scope to "does it fit as built." Absent either, the hardware answer stands: **ESP32 /
-ESP32-C3** removes the constraint outright. wolfSSL's own published memory figures (referenced
-below) remain the right numbers to start from *if* an ESP32-class target is ever adopted; they
-are not achievable on this chip's 80 KB DRAM once this firmware's own footprint is accounted for.
+  | Stage | DRAM free | Max block | Frag | IRAM free | Δ vs baseline |
+  |---|---:|---:|---:|---:|---:|
+  | baseline (pre-wolfSSL) | 20,752 | 20,168 | 3 % | 12,520 | — |
+  | post-wolfSSL_Init | 20,752 | 20,168 | 3 % | 12,520 | 0 |
+  | post-CTX_new | 20,488 | 20,168 | 2 % | 12,520 | −264 |
+  | post-config | 20,608 | 20,168 | 3 % | 12,520 | −144 |
+  | pre-connect | 20,608 | 20,168 | 3 % | 12,520 | −144 |
+  | post-tcp-connect | 20,224 | 19,976 | 2 % | 12,520 | −528 |
+  | post-SSL_new | 17,864 | 17,704 | 1 % | 12,520 | −2,888 |
+  | post-handshake-fail | 13,904 | 13,744 | 2 % | 12,520 | −6,848 |
+  | post-cleanup | 18,328 | 15,240 | 16 % | 12,520 | −2,424 |
+
+  The handshake itself **failed with wolfSSL err −326 (record layer version error)** against
+  `httpbin.org:443` ~200 ms in, so no post-handshake-ok/steady-state rows exist — that is a
+  protocol/config issue in the TLS 1.3-only PoC configuration, **not a memory failure**: the
+  device completed the full lifecycle, printed every instrumentation stage, cleaned up, and then
+  connected to the production WS backend and ran normally (`ws=up`, heap 14 k steady, frag 7 %,
+  zero crashes across the capture). IRAM (second heap) is untouched throughout — wolfSSL
+  allocates purely from the DRAM heap (there is no XMALLOC/IRAM routing in this PoC).
+
+**Conclusion: wolfSSL now fits this port.** Measured cost on-device: ~26.1 KB flash (relocated
+`.rodata`) + ~0.5 KB extra DRAM static vs the shipping build + **≥ 6.8 KB peak DRAM heap during a
+(failed, ~200 ms) handshake** — a completed TLS 1.3 handshake will peak higher; with ~20.7 KB free
+at PoC start the margin is comfortable. Post-cleanup the heap recovers to within 2.4 KB of
+baseline (fragmentation 16 % immediately after, settling to 7 %). The remaining work for a real
+TLS transport is protocol-level (resolve the −326 version error, then re-measure
+post-handshake-ok/steady-state), not memory-level. The earlier conclusion that only ESP32-class
+hardware could host wolfSSL is superseded by these measurements; wolfSSL's published figures
+below remain useful context for an eventual full integration.
 
 <details>
 <summary>wolfSSL's published numbers (context, not achieved here)</summary>
