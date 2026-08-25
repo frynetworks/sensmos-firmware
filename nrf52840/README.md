@@ -76,14 +76,26 @@ encryption") is refused — a node shipping plaintext sensor batches is worse th
 silent one. An unparseable PSK leaves the previous config untouched and answers
 `bad_psk`. Settings persist in the `sensmos_mesh` namespace.
 
-**Duty cycle.** Meshtastic airtime is charged to the *same* EU868 1 %/h counter as the
-beacon and the SMOSB frames, and SMOS has priority: when the budget runs out, mesh TX
-pauses first (`[mesh] TX paused — shared duty budget spent`). SF11 is expensive — one
-~300 B batch costs ~1.0 s of SMOS airtime and ~3.4 s of Meshtastic airtime — so a node
-sending a batch every three minutes reaches the 36 s/h cap partway through the hour and
-throttles until the next window. Note that 869.4–869.65 MHz is legally a 10 % band
-(which is why Meshtastic uses it) while 868.1 MHz is 1 %: budgeting both against 1 % is
-deliberately conservative, not a regulatory requirement.
+**Duty cycle — one counter per sub-band.** EU868 does not have a single node-wide
+allowance, it has one per sub-band, and the two protocols sit in different ones:
+
+| Band | Range | Limit | Used by |
+|---|---|---|---|
+| `g1` | 868.0–868.6 MHz | 1 % = 36 s/h | SENSMOS beacon + SMOSB uplinks (868.1) |
+| `g4` | 869.4–869.65 MHz | 10 % = 360 s/h | Meshtastic (869.525) |
+
+Every transmitter resolves its band from the frequency it is about to use
+(`duty_for_freq()`), so each one debits and is limited by its own counter, and the two
+hour windows roll independently. SF11 is expensive — a ~300 B batch costs ~1.0 s in g1
+and ~3.4 s in g4 — but that no longer matters to the other protocol: a node that has
+spent its whole SMOS allowance keeps relaying over Meshtastic, and vice versa. Log lines
+name the band they are talking about (`duty 11673/36000ms/h g1`,
+`duty 39811/360000ms/h g4`, `beacon skipped — g1 duty budget spent`,
+`[mesh] TX paused — g4 duty budget spent`).
+
+`tools/gate_duty_bands.py` asserts this on real hardware: it drives batches until the
+node passes the old shared 36 s reference point and fails if Meshtastic stops there, if
+mesh airtime shows up in the g1 counter, or if either band exceeds its own limit.
 
 ## Build & flash
 
@@ -102,6 +114,8 @@ sequence resolving ports by VID:PID.
 - `tools/flash_capture.py` — touch → DFU flash → bounded serial capture from boot.
 - `tools/gate_heap_nrf.py` — heap gate / soak: asserts steady state, `[HEAP] free=` ≥
   `--floor` (default 60000), no crash markers, drift ≤ `--drift-max`.
+- `tools/gate_duty_bands.py` — per-sub-band duty gate: drives batches and asserts the
+  g1/g4 counters stay independent and within their own regulatory limits.
 
 ## Serial commands
 

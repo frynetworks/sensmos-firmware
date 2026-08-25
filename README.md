@@ -62,7 +62,7 @@ See [esp8266/README.md](esp8266/README.md) for the onboarding flow, serial tools
 
 PlatformIO port for the XIAO nRF52840 + Wio-SX1262 — a node with **no WiFi hardware**: LoRa is the only radio uplink, BLE + USB-serial handle provisioning. Boot-time pinout probing covers the known XIAO/SX1262 wirings; data batches are ECDSA-signed and leave the node as chunked `0xE1`/`SMOSB` LoRa frames under the EU868 duty-cycle budget.
 
-**Dual-protocol**: the same signed batch is also transmitted as **Meshtastic** packets (869.525 MHz, LongFast, AES-CTR channel encryption) time-division multiplexed on the single SX1262 — so an existing mesh and its MQTT bridge can relay SENSMOS data without a SENSMOS gateway. Both protocols share one duty-cycle budget, SMOS first. See [nrf52840/README.md](nrf52840/README.md).
+**Dual-protocol**: the same signed batch is also transmitted as **Meshtastic** packets (869.525 MHz, LongFast, AES-CTR channel encryption) time-division multiplexed on the single SX1262 — so an existing mesh and its MQTT bridge can relay SENSMOS data without a SENSMOS gateway. Duty cycle is tracked per EU868 sub-band (g1 868.0–868.6 at 1 % for SENSMOS, g4 869.4–869.65 at 10 % for Meshtastic), so neither protocol can spend the other's airtime allowance. See [nrf52840/README.md](nrf52840/README.md).
 
 ### `docker/` — containerized node
 

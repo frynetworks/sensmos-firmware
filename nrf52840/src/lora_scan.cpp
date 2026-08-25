@@ -526,8 +526,38 @@ static struct {
 } s_link = {};
 
 static int      s_cur_ch   = -1;         // indeks kanału, na którym stoi radio
-static uint32_t s_duty_ms  = 0;          // airtime w bieżącym oknie godzinowym
-static uint32_t s_duty_h   = 0;          // numer okna (epoch/3600)
+
+// ── Duty cycle, per EU868 sub-band ───────────────────────────────────────────
+// One counter per sub-band, not one per node: g1 (868.0-868.6) allows 1% and g4
+// (869.4-869.65) allows 10%, so charging Meshtastic's SF11 airtime to the SMOS
+// counter starved both protocols while g4 still had ~90% of its allowance unused.
+// Each transmitter resolves its band FROM THE FREQUENCY IT IS ABOUT TO USE, so a
+// channel-plan change moves the accounting with it.
+struct DutyBand {
+    uint32_t used_ms;
+    uint32_t limit_ms;
+    uint32_t hour;                       // epoch/3600 of the window used_ms belongs to
+    const char* name;
+};
+static DutyBand s_duty_g1 = { 0, DUTY_G1_LIMIT_MS, 0, "g1" };
+static DutyBand s_duty_g4 = { 0, DUTY_G4_LIMIT_MS, 0, "g4" };
+
+static DutyBand* duty_for_freq(float mhz) {
+    if (mhz >= 869.4f && mhz <= 869.65f) return &s_duty_g4;
+    if (mhz >= 868.0f && mhz <= 868.6f)  return &s_duty_g1;
+    return &s_duty_g1;                   // unknown channel: charge the strictest band
+}
+
+// Rolls the band's hour window, then answers whether `est` ms still fits. Windows
+// roll independently — a band that has not transmitted keeps its own stale hour
+// number until it does, which is harmless because the reset happens before the check.
+static bool duty_allows(DutyBand* b, uint32_t now, uint32_t est) {
+    uint32_t h = now / 3600;
+    if (h != b->hour) { b->hour = h; b->used_ms = 0; }
+    return b->used_ms + est <= b->limit_ms;
+}
+static void duty_debit(DutyBand* b, uint32_t air) { b->used_ms += air; }
+
 static uint32_t s_tx_seq   = 0;
 static uint32_t s_rx_total = 0, s_rx_dropped = 0;
 static uint32_t s_rx_min   = 0, s_rx_in_min = 0;   // licznik cap/min
@@ -673,8 +703,7 @@ static void beacon_code(char out[9], uint32_t minute) {
 // Nadanie beaconu. Zwraca airtime w ms (0 = nie nadano).
 static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     uint32_t now = ws_epoch_now();
-    uint32_t h = now / 3600;
-    if (h != s_duty_h) { s_duty_h = h; s_duty_ms = 0; }
+    DutyBand* band = duty_for_freq(c.freq);
     // Ramka niesie to, czego ODBIORNIK nie ma jak zmierzyc: moc nadawania (bez niej nie
     // policzysz tlumienia trasy, bo tlumienie = txp - rssi) oraz podloge i szczyt szumu
     // u nadawcy (bez nich nie odroznisz "slabo go slysze bo daleko" od "slabo bo u niego
@@ -696,8 +725,9 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     // Airtime z RZECZYWISTEJ dlugosci ramki. Stale 44 B przestaly byc prawda, gdy doszedl
     // kod (do 47 B), a zanizony szacunek okrada licznik duty cycle z tego, po co istnieje.
     uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, (uint8_t)(n + 1));
-    if (s_duty_ms + est > LORA_LINK_DUTY_MS_H) {
-        LOGW("lora", "beacon skipped — duty cycle budget spent (%lums/h)", (unsigned long)s_duty_ms);
+    if (!duty_allows(band, now, est)) {
+        LOGW("lora", "beacon skipped — %s duty budget spent (%lu/%lums per h)",
+             band->name, (unsigned long)band->used_ms, (unsigned long)band->limit_ms);
         return 0;
     }
     uint32_t t0 = millis();
@@ -710,9 +740,10 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     s_irq = false;
     s_radio.startReceive();                                  // NATYCHMIAST z powrotem w nasłuch
     if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "beacon TX failed (%d)", st); return 0; }
-    s_duty_ms += air; s_tx_seq++;
-    LOGI("lora", "beacon #%lu sent @%.3f SF%u (%lums air, duty %lums/h)",
-         (unsigned long)s_tx_seq - 1, c.freq, c.sf, (unsigned long)air, (unsigned long)s_duty_ms);
+    duty_debit(band, air); s_tx_seq++;
+    LOGI("lora", "beacon #%lu sent @%.3f SF%u (%lums air, duty %lu/%lums/h %s)",
+         (unsigned long)s_tx_seq - 1, c.freq, c.sf, (unsigned long)air,
+         (unsigned long)band->used_ms, (unsigned long)band->limit_ms, band->name);
     return air;
 }
 
@@ -765,8 +796,7 @@ bool lora_uplink_pending() { return s_up_pending; }
 static void uplink_tx_next(const LoraLinkCh& c) {
     if (!s_up_pending) return;
     uint32_t now = ws_epoch_now();
-    uint32_t h = now / 3600;
-    if (h != s_duty_h) { s_duty_h = h; s_duty_ms = 0; }
+    DutyBand* band = duty_for_freq(c.freq);
 
     char pl[LORA_RX_HEX_MAX + 4];
     size_t off = (size_t)s_up_frag * LORA_UPLINK_RAW_CHUNK;
@@ -782,12 +812,12 @@ static void uplink_tx_next(const LoraLinkCh& c) {
     pl[0] = (char)LORA_UPLINK_MAGIC;
 
     uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, (uint8_t)(n + 1));
-    if (s_duty_ms + est > LORA_LINK_DUTY_MS_H) {
+    if (!duty_allows(band, now, est)) {
         // Budget spent — batch waits for the next duty window; frames are idempotent.
         static uint32_t warned_h = 0;
-        if (warned_h != h) { warned_h = h;
-            LOGW("lora", "uplink paused — duty cycle budget spent (%lums/h)",
-                 (unsigned long)s_duty_ms); }
+        if (warned_h != band->hour) { warned_h = band->hour;
+            LOGW("lora", "uplink paused — %s duty budget spent (%lu/%lums per h)",
+                 band->name, (unsigned long)band->used_ms, (unsigned long)band->limit_ms); }
         return;
     }
     uint32_t t0 = millis();
@@ -797,10 +827,11 @@ static void uplink_tx_next(const LoraLinkCh& c) {
     s_irq = false;                       // TxDone shares DIO1 with RxDone — drop it
     s_radio.startReceive();
     if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "uplink TX failed (%d)", st); return; }
-    s_duty_ms += air;
-    LOGI("lora", "uplink frame %u/%u sent @%.3f (%luB, %lums air, duty %lums/h)",
+    duty_debit(band, air);
+    LOGI("lora", "uplink frame %u/%u sent @%.3f (%luB, %lums air, duty %lu/%lums/h %s)",
          (unsigned)(s_up_frag + 1), (unsigned)s_up_nfrag, c.freq,
-         (unsigned long)(n + 1), (unsigned long)air, (unsigned long)s_duty_ms);
+         (unsigned long)(n + 1), (unsigned long)air,
+         (unsigned long)band->used_ms, (unsigned long)band->limit_ms, band->name);
     if (++s_up_frag >= s_up_nfrag) {
         s_up_pending = false;
         LOGI("lora", "uplink batch seq %u complete (%u frames)", (unsigned)s_up_seq,
@@ -915,11 +946,13 @@ static void link_tick() {
     if (!smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
         sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
         last_mesh_sec = sec_in_min;
-        uint32_t h = now / 3600;
-        if (h != s_duty_h) { s_duty_h = h; s_duty_ms = 0; }
-        uint32_t air = mesh_tx_next(s_radio, s_duty_ms, LORA_LINK_DUTY_MS_H,
+        // Meshtastic transmits in g4, which has its OWN 10% allowance — SMOS traffic
+        // in g1 neither spends it nor is spent by it.
+        DutyBand* mband = duty_for_freq(MESH_FREQ);
+        duty_allows(mband, now, 0);             // roll g4's hour window before reading it
+        uint32_t air = mesh_tx_next(s_radio, mband->used_ms, mband->limit_ms,
                                     g_pin->tcxo, g_pin->rxen, g_pin->dio2_rf != 0);
-        s_duty_ms += air;                       // shared EU868 budget
+        duty_debit(mband, air);
         // Back to SENSMOS parameters no matter how mesh TX ended: a failed mesh
         // transmit that left the radio on 869.525/SF11 would silently kill SMOS RX.
         if (!cfg_ch(c)) { LOGW("lora", "restore after mesh TX failed"); delay(200); return; }
@@ -973,14 +1006,22 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
 bool lora_link_on() { return s_link.on; }
 
 void lora_link_status_json(String& out) {
-    char b[220];
+    char b[288];                             // grew with the per-band duty fields
     uint32_t now = ws_epoch_now();
+    // duty_ms_h stays as the g1 figure so anything reading the old field keeps seeing
+    // the SENSMOS band it always meant; g1_ms/g4_ms carry the per-band split. Keys are
+    // kept short on purpose — this object is embedded in the serial get_info response,
+    // which has a fixed-size buffer.
     snprintf(b, sizeof(b),
         "{\"on\":%s,\"beacon\":%s,\"slot\":%u,\"ch\":%d,\"n_ch\":%u,\"tx_seq\":%lu,"
-        "\"rx_total\":%lu,\"rx_dropped\":%lu,\"duty_ms_h\":%lu,\"epoch\":%lu}",
+        "\"rx_total\":%lu,\"rx_dropped\":%lu,\"duty_ms_h\":%lu,"
+        "\"g1_ms\":%lu,\"g1_max\":%lu,\"g4_ms\":%lu,\"g4_max\":%lu,\"epoch\":%lu}",
         s_link.on ? "true" : "false", s_link.beacon ? "true" : "false", s_link.slot,
         s_cur_ch, s_link.n_ch, (unsigned long)s_tx_seq, (unsigned long)s_rx_total,
-        (unsigned long)s_rx_dropped, (unsigned long)s_duty_ms, (unsigned long)now);
+        (unsigned long)s_rx_dropped, (unsigned long)s_duty_g1.used_ms,
+        (unsigned long)s_duty_g1.used_ms, (unsigned long)s_duty_g1.limit_ms,
+        (unsigned long)s_duty_g4.used_ms, (unsigned long)s_duty_g4.limit_ms,
+        (unsigned long)now);
     out = b;
 }
 

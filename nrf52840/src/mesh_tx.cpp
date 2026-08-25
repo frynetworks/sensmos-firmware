@@ -168,8 +168,8 @@ uint32_t mesh_tx_next(SX1262& radio, uint32_t duty_ms, uint32_t duty_budget,
 
     const uint32_t est = mesh_airtime_ms(MESH_SF, MESH_BW, MESH_CR, (uint16_t)flen);
     if (duty_ms + est > duty_budget) {
-        // SMOS has priority on a shared budget: mesh simply waits for the next
-        // duty window. Frames are idempotent, so nothing is lost by waiting.
+        // The caller passes g4's own counter and limit — mesh waits only when the
+        // Meshtastic sub-band itself is spent, never because SMOS used up g1.
         // Log once per duty window — the counter falling is the caller starting a
         // new hour, which is the only moment a fresh warning carries information.
         static uint32_t last_duty = 0;
@@ -178,7 +178,7 @@ uint32_t mesh_tx_next(SX1262& radio, uint32_t duty_ms, uint32_t duty_budget,
         last_duty = duty_ms;
         if (!warned) {
             warned = true;
-            LOGW("mesh", "TX paused — shared duty budget spent (%lu/%lums per h, need %lums)",
+            LOGW("mesh", "TX paused — g4 duty budget spent (%lu/%lums per h, need %lums)",
                  (unsigned long)duty_ms, (unsigned long)duty_budget, (unsigned long)est);
         }
         return 0;
@@ -208,10 +208,10 @@ uint32_t mesh_tx_next(SX1262& radio, uint32_t duty_ms, uint32_t duty_budget,
 
     s_sent_total++;
     s_air_total += air;
-    LOGI("mesh", "packet %u/%u sent @%.3f SF%u (id 0x%08lx, %uB, %lums air, duty %lums/h)",
+    LOGI("mesh", "packet %u/%u sent @%.3f SF%u (id 0x%08lx, %uB, %lums air, duty %lu/%lums/h g4)",
          (unsigned)(s_frag + 1), (unsigned)s_nfrag, MESH_FREQ, MESH_SF,
          (unsigned long)s_packet_id, (unsigned)flen,
-         (unsigned long)air, (unsigned long)(duty_ms + air));
+         (unsigned long)air, (unsigned long)(duty_ms + air), (unsigned long)duty_budget);
     s_packet_id++;
     if (++s_frag >= s_nfrag) {
         s_pending = false;

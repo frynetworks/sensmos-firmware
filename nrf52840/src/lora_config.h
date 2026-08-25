@@ -84,7 +84,18 @@ struct LoraPinout {
 #define LORA_LINK_SLOT_GAP_S  7
 #define LORA_LINK_TX_POWER    14      // dBm — EU868 ERP limit
 
-#define LORA_LINK_DUTY_MS_H   36000UL // 1% of 3600 s = 36 s airtime/h
+// ── EU868 duty cycle, PER SUB-BAND ────────────────────────────
+// ERC 70-03 gives each sub-band its own allowance; a single node-wide counter is
+// therefore wrong in both directions — it throttles traffic that is still legal on
+// its own band, and it would hide an over-run if two bands were ever summed.
+//   g1  868.0-868.6  MHz -> 1%   =  36 s/h  (SENSMOS beacon + SMOSB uplinks @868.1)
+//   g4  869.4-869.65 MHz -> 10%  = 360 s/h  (Meshtastic @869.525)
+#define DUTY_G1_LIMIT_MS      36000UL
+#define DUTY_G4_LIMIT_MS      360000UL
+
+// Kept as the g1 limit: the SENSMOS link plan lives in g1, and existing references
+// to this name mean "the budget for the channel the link is transmitting on".
+#define LORA_LINK_DUTY_MS_H   DUTY_G1_LIMIT_MS
 
 #define LORA_BEACON_MAGIC     0xE0
 #define LORA_BEACON_PREFIX    "SMOS "
