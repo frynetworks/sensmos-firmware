@@ -123,6 +123,17 @@ tools/
   signal (the client must join the node's AP), not as the BLE timing channel.
 * Over-the-air portal interaction was verified structurally (routes, page size, DNS catch-all) and
   by compile + hardware boot; the browser flow itself is a manual test.
+* **Portal under association load — partial mitigation.** When a phone associates to the SoftAP it
+  emits a captive-portal detection burst (many DNS queries + several parallel TCP probes) before any
+  `register` arrives. On a live onboarding this reproduced a hardware-WDT reset (`rst cause:4`, ~19 s
+  into the session) *upstream* of the register handler — so the earlier register-path `yield()`s were
+  a false fix. Root cause is SDK/lwIP-side: the NONOS SDK monopolises the CPU servicing
+  association+DHCP+DNS+TCP, and the ~8.4 s HW WDT has **no direct feed API** — if the SDK does not
+  hand back within its window, nothing sketch-side can feed it. Mitigation shipped in `ble_tick`
+  (`captive_portal.cpp`): a bounded DNS-drain loop with a `yield()` per iteration plus `yield()`s
+  around `handleClient()`, giving the SDK more service windows per pass. This shrinks the stall
+  window but is **not a guaranteed cure** for an SDK-side monopoly; on-device confirmation under a
+  real phone association is required to close it out.
 
 ### Ghost-session resilience (2026-08-25)
 

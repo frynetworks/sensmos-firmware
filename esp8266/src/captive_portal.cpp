@@ -653,8 +653,23 @@ void ble_stop() {
 
 void ble_tick() {
     if (!g_ble_active) return;
-    if (s_dns) s_dns->processNextRequest();
+
+    // Portal-under-load HW WDT (rst cause:4): when a phone associates to the
+    // SoftAP it floods captive-portal detection (a DNS burst + several parallel
+    // TCP probes). The NONOS SDK/lwIP path servicing association+DHCP+DNS+TCP can
+    // monopolise the CPU; yield() below returns INTO the SDK and hands it more
+    // service windows per loop pass — the only sketch-side lever. The ~8.4s
+    // hardware WDT has no direct feed API, so a true SDK-side stall is not fully
+    // curable from the sketch; these bounded yields shrink the window, not a cure.
+    if (s_dns) {
+        for (int i = 0; i < 8; i++) {   // drain the DNS burst, bounded + fed
+            s_dns->processNextRequest();
+            yield();
+        }
+    }
+    yield();
     if (s_srv) s_srv->handleClient();
+    yield();
 
     if (s_restart_at_ms && millis() > s_restart_at_ms) {   // factory_reset — po wysłaniu odpowiedzi
         delay(200); ESP.restart();
