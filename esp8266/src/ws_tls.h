@@ -46,7 +46,8 @@ public:
 
     // Stuby pod nazwy BearSSL — gałąź SSL_BARESSL WebSocketsClient.cpp kompiluje te
     // wywołania bezwarunkowo (setInsecure woła DWA razy: :300 i :983 — idempotentne).
-    // Weryfikacja certu: wolfSSL VERIFY_NONE (postawa PoC, pinning = follow-up).
+    // Weryfikacja certu: pinning ISRG Root YE + VERIFY_PEER (ws_tls.cpp; degradacja
+    // do VERIFY_NONE tylko gdy load kotwicy padnie).
     void setInsecure() {}
     void setFingerprint(const uint8_t* fp) { (void)fp; }
     void setTrustAnchors(const BearSSL::X509List* ta) { (void)ta; }

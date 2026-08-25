@@ -1,16 +1,17 @@
 #pragma once
-// Kotwica zaufania (pinning) dla api.sensmos.com — ISRG Root YE (intermediate CA, C=US O=ISRG CN=Root YE, P-384, wygasa 2032-09-02)
+// Kotwica zaufania (pinning) dla api.sensmos.com — ISRG Root YE (C=US O=ISRG CN=Root YE, P-384, wygasa 2032-09-02)
 // DER, 682 bajtow, PROGMEM (flash, nie DRAM).
+// Wygenerowane przez tools/gen_ca_cert_h.py — przy rotacji NIE edytuj tablicy recznie.
 //
-// Dlaczego NIE ISRG Root X2 (2040): lancuch = leaf(P-256) <- YE2(P-384) <- Root YE(P-384)
-// <- [X2-cross]. Kazda weryfikacja ECDSA P-384 to ~2.7s ciaglego liczenia na 160MHz
-// (pelne SP, bez SP_SMALL) — 3 weryfikacje do X2 przekraczaly NIEWYLACZALNY HW WDT
-// (~8.4s, rst cause:4 w petli). Kotwica nizej w lancuchu = mniej weryfikacji P-384.
-// SW WDT (~3.2s stale; parametr wdtEnable ignorowany) jest wylaczany na czas
-// handshake'u w ws_tls.cpp. Przy rotacji hierarchii LE: wymienic ten cert
-// (openssl s_client -showcerts) i przebudowac — patrz README sekcja TLS.
-//
-// Dlaczego nie X1: RSA-4096 -> SP_INT_BITS 4096 -> +256B na kazdym bignumie.
+// ============ ROTACJA ============
+// 1. Pobierz nowy cert (DER) z https://letsencrypt.org/certificates/ lub wyciagnij
+//    z lancucha: openssl s_client -connect api.sensmos.com:443 -showcerts
+// 2. Zweryfikuj: openssl x509 -inform DER -in nowy.der -noout -subject -dates
+// 3. py -3 tools/gen_ca_cert_h.py nowy.der src/ca_cert.h "<subject, wygasa YYYY-MM-DD>"
+// 4. Przebuduj i sflashuj; zweryfikuj na urzadzeniu: "cert pinning active" +
+//    "connected: version=..." BEZ linii "verify disabled (degraded)".
+// tools/check_cert_expiry.py (pre-build) ostrzega <180 dni przed wygasnieciem.
+// =================================
 //
 // UWAGA: ten naglowek wlacza TYLKO ws_tls.cpp. NIE dolaczac do ws_tls.h — tamten
 // naglowek jest wstrzykiwany do TU biblioteki WebSockets i tablica by sie zduplikowala.

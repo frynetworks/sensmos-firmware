@@ -19,6 +19,24 @@ static const unsigned long HS_DEADLINE_MS = 30000;   // twardy limit handshake'u
 
 static WOLFSSL_CTX* g_ctx = nullptr;
 
+// Zapisana sesja TLS (bilet NST) — przezywa cykl zycia WsTlsClient (biblioteka kasuje
+// i tworzy klienta przy kazdym reconnec'cie). RAM-only, single-boot (materia biletu
+// wiazana z zegarem ms). Save: w stop() PRZED wolfSSL_free — bilety NST przychodza
+// PO handshake'u, a wczesniejszy get1_session podbija refcount i SetTicket forkuje
+// sesje (HaveUniqueSessionObj) — zapisany uchwyt zostalby bez biletu NA ZAWSZE.
+static WOLFSSL_SESSION* g_session = nullptr;
+
+#ifdef SENSMOS_TEST_FORCE_RECONNECT
+// Hak testowy (flaga NIGDY nie definiowana w envach; wlaczana per-test przez
+// PLATFORMIO_BUILD_FLAGS): raz, ~90s po pierwszym handshake'u, transport sam sie
+// rozlacza — biblioteka reconnectuje po 5s i drugi handshake cwiczy resumption.
+// Jedyny deterministyczny trigger bez WiFi-credow i bez rebootu (reboot traci sesje).
+static bool s_test_forced = false;
+static unsigned long s_test_hs_at = 0;
+#endif
+
+static void ws_tls_ticket_seen_cb_reg(WOLFSSL* ssl);   // fwd
+
 // [tls-heap] line is DELIBERATELY not in the "heap <N>k" shape — see log.cpp's [mem] comment:
 // tools/gate_heap.py's HEAP_RE would otherwise vacuum these readings into its min_heap gate.
 // Od flipu 2026-08-24 ten transport JEST w shippingowym buildzie (SENSMOS_USE_TLS domyslne);
@@ -88,7 +106,7 @@ static bool ws_tls_ctx_ensure() {
         return false;
     }
     // Pinning: ISRG Root YE jako kotwica (ca_cert.h — dlaczego nie X2/X1: czas P-384 vs HW WDT).
-    // PROGMEM -> tymczasowy bufor heap (543B): XMEMCPY wolfSSL-a nie jest pgm-aware.
+    // PROGMEM -> tymczasowy bufor heap (CA_ANCHOR_DER_LEN, 682B): XMEMCPY wolfSSL-a nie jest pgm-aware.
     // Degradacja: gdy load padnie (malloc/format), VERIFY_NONE + log — node ma dzialac,
     // nie cegla; degradacje widac w serialu i mozna ja zlapac w QA.
     {
@@ -126,8 +144,23 @@ static bool ws_tls_ctx_ensure() {
     }
     wolfSSL_CTX_SetIOSend(g_ctx, ws_tls_io_send_cb);
     wolfSSL_CTX_SetIORecv(g_ctx, ws_tls_io_recv_cb);
+    // Wewnetrzny cache sesji wylaczony w runtime (AddSession no-op, wiersz cache'a
+    // nigdy nie alokowany) — sesje trzymamy sami w g_session przez refcount.
+    wolfSSL_CTX_set_session_cache_mode(g_ctx, WOLFSSL_SESS_CACHE_OFF);
     ws_tls_print_heap("post-ctx-new");
     return true;
+}
+
+// Notyfikacja przyjscia biletu NST (TYLKO log — snapshot sesji robi stop();
+// wolfSSL_set_SessionTicket nie przenosi sekretu resumption, patrz ssl.c:3845).
+static int ws_tls_ticket_cb(WOLFSSL* ssl, const unsigned char* ticket, int ticketSz,
+                            void* cb_ctx) {
+    (void)ssl; (void)ticket; (void)cb_ctx;
+    LOGI("tls", "session ticket received (len=%d)", ticketSz);
+    return 0;
+}
+static void ws_tls_ticket_seen_cb_reg(WOLFSSL* ssl) {
+    wolfSSL_set_SessionTicket_cb(ssl, ws_tls_ticket_cb, nullptr);
 }
 
 WsTlsClient::~WsTlsClient() {
@@ -170,6 +203,18 @@ int WsTlsClient::tlsConnect(IPAddress ip, uint16_t port, const char* sniHost) {
     wolfSSL_SetIOWriteCtx(_ssl, this);
     if (sniHost)
         wolfSSL_UseSNI(_ssl, WOLFSSL_SNI_HOST_NAME, sniHost, (word16)strlen(sniHost));
+    ws_tls_ticket_seen_cb_reg(_ssl);
+    // Wznowienie: bilet z poprzedniej sesji -> PSK 1-RTT (omija ~5.4s weryfikacji
+    // lancucha P-384). Wygasly bilet -> WOLFSSL_FAILURE PRZED ustawieniem resuming
+    // = czysty pelny handshake; zwalniamy uchwyt (inaczej refcount 2 = fork-tax
+    // przy nastepnym SetTicket) i zlapiemy swiezy przy stop().
+    if (g_session) {
+        if (wolfSSL_set_session(_ssl, g_session) != WOLFSSL_SUCCESS) {
+            LOGI("tls", "saved session rejected/expired — full handshake");
+            wolfSSL_SESSION_free(g_session);
+            g_session = nullptr;
+        }
+    }
     ws_tls_print_heap("post-ssl-new");
 
     // Handshake z ograniczonym retry na WANT_READ/WANT_WRITE — naprawia jednostrzałowy
@@ -183,7 +228,8 @@ int WsTlsClient::tlsConnect(IPAddress ip, uint16_t port, const char* sniHost) {
     // SW WDT wyłączony NA CZAS handshake'u; HW WDT (~8.4s, niewyłączalny) zostaje
     // jako backstop — pełne SP liczy chain w ~3-5s, mieści się.
     ESP.wdtDisable();
-    unsigned long deadline = millis() + HS_DEADLINE_MS;
+    unsigned long hs_start = millis();
+    unsigned long deadline = hs_start + HS_DEADLINE_MS;
     int ret;
     for (;;) {
         ret = wolfSSL_connect(_ssl);
@@ -207,9 +253,13 @@ int WsTlsClient::tlsConnect(IPAddress ip, uint16_t port, const char* sniHost) {
     ESP.wdtEnable(8000);
 
     _hsDone = true;
+#ifdef SENSMOS_TEST_FORCE_RECONNECT
+    s_test_hs_at = millis();
+#endif
     ws_tls_print_heap("post-handshake-ok");
-    LOGI("tls", "connected: version=%s cipher=%s",
-         wolfSSL_get_version(_ssl), wolfSSL_get_cipher(_ssl));
+    LOGI("tls", "connected: version=%s cipher=%s hs_ms=%lu resumed=%d",
+         wolfSSL_get_version(_ssl), wolfSSL_get_cipher(_ssl),
+         (unsigned long)(millis() - hs_start), wolfSSL_session_reused(_ssl));
     return 1;
 }
 
@@ -228,6 +278,16 @@ size_t WsTlsClient::write(const uint8_t* buf, size_t size) {
 
 int WsTlsClient::available() {
     if (!_ssl) return 0;
+#ifdef SENSMOS_TEST_FORCE_RECONNECT
+    // Raz na boot: wymuszony reconnect ~90s po handshake'u (test resumption).
+    if (!s_test_forced && _hsDone && s_test_hs_at &&
+        (long)(millis() - s_test_hs_at) > 90000) {
+        s_test_forced = true;
+        LOGI("tls", "TEST: forcing disconnect to exercise session resumption");
+        stop();
+        return 0;
+    }
+#endif
     int p = wolfSSL_pending(_ssl);
     if (p > 0) return p;
     if (WiFiClient::available() > 0) {
@@ -268,6 +328,16 @@ uint8_t WsTlsClient::connected() {
 
 void WsTlsClient::stop() {
     if (_ssl) {
+        // Snapshot sesji (z biletem NST) PRZED free — jedyny bezpieczny punkt:
+        // bilety przyszly w trakcie zycia polaczenia; get1_session adoptuje przez
+        // refcount (bez kopii), free tylko zdejmuje referencje.
+        if (_hsDone) {
+            WOLFSSL_SESSION* s = wolfSSL_get1_session(_ssl);
+            if (s) {
+                if (g_session && g_session != s) wolfSSL_SESSION_free(g_session);
+                g_session = s;
+            }
+        }
         wolfSSL_shutdown(_ssl);   // pojedyncza, nieblokująca próba close_notify
         wolfSSL_free(_ssl);
         _ssl = nullptr;

@@ -269,6 +269,36 @@ handshake over TLS, and runs normally. `nodemcuv2_tls` remains as a legacy alias
   and continues with VERIFY_NONE rather than bricking. Anchor expires 2032-09-02; on Let's
   Encrypt hierarchy rotation, re-extract the chain (`openssl s_client -showcerts`) and rebuild
   `ca_cert.h`.
+* **TLS 1.3 session resumption (2026-08-24):** the transport saves the NewSessionTicket
+  session at teardown (`wolfSSL_get1_session` inside `stop()`, before `wolfSSL_free` — the
+  ONLY safe point: tickets arrive post-handshake, and an earlier save bumps the refcount so
+  `SetTicket`'s `HaveUniqueSessionObj` forks the session and the saved handle stays
+  ticketless forever) and restores it before the next `wolfSSL_connect`. **Measured
+  on-device: full handshake 6,891 ms → resumed 865-883 ms (`resumed=1`), ~7.9× faster** —
+  which matters for safety, not just latency: the full handshake's ~6.8 s of P-384 compute
+  sits ~1.6 s under the non-disableable HW WDT, while a resumed handshake skips chain
+  verification entirely. Five consecutive save/restore cycles showed flat heap (leak-free
+  recycling); nginx issues a fresh ticket (2 NSTs, ~32 B each) per session. Config: the
+  `NO_SESSION_CACHE` era is over — it compiled `get1_session/set_session` OUT; replaced by
+  `HAVE_SESSION_TICKET` + micro-cache defines with the cache disabled at runtime
+  (`WOLFSSL_SESS_CACHE_OFF`; net ~+24 B .bss). Two traps burned into the config comments:
+  `NO_PSK` MUST stay (dropping it costs +1,538 B `ENCRYPT_LEN`), and `MAX_PSK_ID_LEN` MUST
+  be capped (384) — the PSK identity buffers are gated `(HAVE_SESSION_TICKET || !NO_PSK)`,
+  and the 1536 default silently added ~3.1 KB to every `ssl->arrays` + ~1.5 KB to the CTX,
+  OOM-ing the first handshake. Session is RAM-only/single-boot (ticket age math uses the
+  ms clock). Test hook: `-DSENSMOS_TEST_FORCE_RECONNECT` (via `PLATFORMIO_BUILD_FLAGS`)
+  forces one disconnect 90 s post-handshake to exercise resumption; note the backend holds
+  a ghost session ~35 s after an abrupt close and rejects re-identify until reaped — a
+  pre-existing server behavior surfaced by the test, not a client bug.
+* **Anchor rotation monitoring:** `tools/check_cert_expiry.py` (pre-build) parses the DER
+  inside `src/ca_cert.h` and prints days-to-expiry every build — warning <180 days,
+  error-banner <30 days (threshold override: `CERT_EXPIRY_WARN_DAYS` env). Root YE expires
+  **2032-09-02**. Rotation procedure lives in `src/ca_cert.h` + `tools/gen_ca_cert_h.py`.
+* **Upstream bug reports** (evidence-complete, ready to file):
+  `docs/upstream-reports/wolfssl-p384-verify-xtensa.md` (generic-math P-384 ECDSA verify
+  returns −155 on valid chains; SP_384 fixes it) and
+  `docs/upstream-reports/esp8266-wdtenable-noop.md` (`ESP.wdtEnable(ms)` argument
+  `(void)`-cast; SW WDT fixed ~3.2 s).
 * **`WEBSOCKETS_MAX_DATA_SIZE=4096` finally works** — and the truth about it: the library
   hard-defines 15 KB with no `#ifndef` (WebSockets.h:66), so the `-D` flag had been silently
   clobbered since it was added; the effective inbound cap on every prior build was 15 KB. The

@@ -23,7 +23,32 @@ CONTENT = """#ifndef WOLFSSL_USER_SETTINGS_H
 #define NO_FILESYSTEM
 #define NO_WRITEV
 #define WOLFSSL_SMALL_STACK
-#define NO_SESSION_CACHE
+/* Wznowienie sesji TLS 1.3 (ticket -> PSK 1-RTT). NO_SESSION_CACHE wycinalo
+ * wolfSSL_get1_session/set_session CALKOWICIE (ssl_sess.c) — zamiast niego
+ * mikro-cache, ktorego i tak nie uzywamy (runtime: SESS_CACHE_OFF w ws_tls.cpp;
+ * sesje trzymamy sami przez refcount). Netto ~+24B .bss.
+ * NO_PSK ZOSTAJE: kazda sciezka resumption jest gatowana
+ * (HAVE_SESSION_TICKET || !NO_PSK) — sam ticket wystarcza, a zdjecie NO_PSK
+ * kosztowaloby +1538B ENCRYPT_LEN (MAX_PSK_ID_LEN). Pulapka NST: bilet
+ * przychodzi PO handshake'u — get1_session wolno wolac dopiero przy stop()
+ * (wczesniejszy save + HaveUniqueSessionObj forkuje sesje i bilet przepada). */
+#define HAVE_SESSION_TICKET
+/* Klient-only device: server-side wolfSSL (w tym maszyneria ticketow serwera)
+ * nigdy nie jest uzywany — bez tego define poszerzal CTX/SSL po wlaczeniu
+ * HAVE_SESSION_TICKET. */
+#define NO_WOLFSSL_SERVER
+#define MICRO_SESSION_CACHE
+#define SESSION_CACHE_DYNAMIC_MEM
+#define NO_SESSION_CACHE_REF
+#define NO_CLIENT_CACHE
+#define WOLFSSL_NO_DEF_TICKET_ENC_CB
+/* Bufory PSK-identity (Arrays.client_identity/server_hint + CTX.server_hint) sa
+ * gatowane (HAVE_SESSION_TICKET || !NO_PSK) — sam ticket-define wciagal 2x1537B
+ * do KAZDEGO ssl->arrays i +1.5KB do CTX (default MAX_PSK_ID_LEN=1536 pod TLS1.3).
+ * W 1.3 identity PSK = bilet NST (~200-260B u nginx) — 384 starcza z zapasem;
+ * wiekszy bilet => resumption pominiete i czysty pelny handshake (tls.c:13429). */
+#define MAX_PSK_ID_LEN 384
+
 #define NO_OLD_TLS
 #define WOLFSSL_TLS13
 #define HAVE_HKDF
