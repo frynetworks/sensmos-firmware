@@ -7,6 +7,7 @@
 #include "ble_config.h"
 #include "identity.h"
 #include "lora_scan.h"
+#include "mesh_tx.h"
 #include "ws_client.h"
 #include "config.h"
 #include "log.h"
@@ -224,6 +225,29 @@ static void ble_process_cmd() {
         notify(resp);
         return;
     }
+
+#if LORA_ENABLED
+    // Meshtastic dual-protocol config over BLE — same JSON as the serial command,
+    // so the app and a tethered console configure the node identically.
+    if (!strcmp(cmd, "set_mesh_cfg")) {
+        const bool     en = doc["enabled"] | true;
+        const char*    ch = doc["channel"];
+        const char*    pk = doc["psk"];
+        const uint32_t pn = doc["portnum"] | 0UL;
+        if (!mesh_tx_configure(en, ch, pk, pn)) { ble_err(cmd, "bad_psk"); return; }
+        ble_ok(cmd);
+        return;
+    }
+    if (!strcmp(cmd, "get_mesh_cfg")) {
+        String st;
+        mesh_tx_status_json(st);
+        char resp[320];
+        snprintf(resp, sizeof(resp),
+            "{\"status\":\"ok\",\"cmd\":\"get_mesh_cfg\",\"mesh\":%s}", st.c_str());
+        notify(resp);
+        return;
+    }
+#endif
 
     ble_err(cmd, "unknown_cmd");
 }

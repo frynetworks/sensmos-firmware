@@ -7,6 +7,7 @@
 #include "log.h"
 #include "ws_client.h"
 #include "identity.h"
+#include "mesh_tx.h"  // dual-protocol: Meshtastic TX shares this radio and duty budget
 #include <SHA256.h>   // nRF port: HMAC-SHA256 via rweather/Crypto (mbedtls absent)
 
 static const LoraPinout PINOUTS[] = LORA_PINOUTS;
@@ -896,10 +897,34 @@ static void link_tick() {
     // Batch uplink (nRF port): one frame per second, after the beacon slot and
     // clear of the guard window around channel rotation.
     static uint32_t last_up_sec = 61;
+    bool smos_tx_this_sec = false;
     if (s_up_pending && sec_in_min != last_up_sec &&
         sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
         last_up_sec = sec_in_min;
         uplink_tx_next(c);
+        smos_tx_this_sec = true;
+    }
+
+    // Meshtastic uplink (dual-protocol): the same batch, in Meshtastic framing, on
+    // the Meshtastic channel. Time-division on one radio — SMOS is served first and
+    // mesh only takes a second where SMOS did not transmit, so neither protocol ever
+    // preempts the other mid-packet. The retune is expensive (~0.7 s of SF11 airtime
+    // plus two begin() calls), so it happens at most once per second and always
+    // hands the radio back on the SENSMOS channel before the RX window below.
+    static uint32_t last_mesh_sec = 61;
+    if (!smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
+        sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
+        last_mesh_sec = sec_in_min;
+        uint32_t h = now / 3600;
+        if (h != s_duty_h) { s_duty_h = h; s_duty_ms = 0; }
+        uint32_t air = mesh_tx_next(s_radio, s_duty_ms, LORA_LINK_DUTY_MS_H,
+                                    g_pin->tcxo, g_pin->rxen, g_pin->dio2_rf != 0);
+        s_duty_ms += air;                       // shared EU868 budget
+        // Back to SENSMOS parameters no matter how mesh TX ended: a failed mesh
+        // transmit that left the radio on 869.525/SF11 would silently kill SMOS RX.
+        if (!cfg_ch(c)) { LOGW("lora", "restore after mesh TX failed"); delay(200); return; }
+        s_irq = false;
+        s_radio.startReceive();
     }
 
     // Ciągły RX — 200 ms pollingu IRQ.

@@ -13,6 +13,8 @@
 #include "serial_cmd.h"
 #include "ble_config.h"
 #include "lora_scan.h"
+#include "mesh_proto.h"
+#include "mesh_tx.h"
 #include "config.h"
 #include <Preferences.h>
 
@@ -73,6 +75,9 @@ void setup() {
     entity_tmp_clear();
 
 #if LORA_ENABLED
+    mesh_proto_selftest();       // protobuf + key derivation + CTR round-trip
+    mesh_tx_init();              // Meshtastic config from storage — before the radio starts
+    heap_stats_print("post-mesh");
     lora_scan_init();            // probes the pinout table; no radio = node runs without LoRa
 #endif
     heap_stats_print("post-lora");

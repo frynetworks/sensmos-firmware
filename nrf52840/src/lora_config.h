@@ -101,3 +101,26 @@ struct LoraPinout {
 #define LORA_UPLINK_PREFIX    "SMOSB "
 #define LORA_UPLINK_CHUNK     96      // base64 payload bytes per frame
 #define LORA_UPLINK_BUF       2048    // max serialized signed batch
+
+// ══ Meshtastic dual-protocol TX (port addition) ═══════════════
+// The same signed batch also leaves the node as Meshtastic packets, so an existing
+// mesh (and its MQTT bridge) can carry SENSMOS data without a SENSMOS gateway.
+// Parameters are the EU868 "LongFast" preset as computed by meshtastic/firmware:
+//   freq  = freqStart(869.4) + bw/2000 + channel_num*(bw/1000), channel_num 0 → 869.525
+//   modem = LONG_FAST: BW 250 kHz, SF11, CR 4/5 (MeshRadio.h modemPresetToParams)
+//   sync  = 0x2b (RadioLibInterface.h), preamble 16 symbols (RadioInterface.h)
+// One packet at a time, TX'd from the same duty-cycle budget as SMOS traffic.
+#define MESH_FREQ             869.525f
+#define MESH_BW               250.0f
+#define MESH_SF               11
+#define MESH_CR               5
+#define MESH_SYNCWORD         0x2B
+#define MESH_PREAMBLE         16
+#define MESH_TX_POWER         LORA_LINK_TX_POWER
+#define MESH_HOP_LIMIT        3
+
+#define MESH_TX_DEFAULT       true          // dual-protocol on out of the box
+#define MESH_CHANNEL_DEFAULT  "LongFast"
+#define MESH_PSK_DEFAULT      "AQ=="        // PSK index 1 = the default channel key
+#define MESH_CHUNK_RAW        160           // batch bytes per Meshtastic packet
+#define MESH_UPLINK_BUF       2048          // max serialized signed batch

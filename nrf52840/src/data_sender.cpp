@@ -14,6 +14,7 @@
 #include "ntp_time.h"
 #include "ws_client.h"
 #include "lora_scan.h"
+#include "mesh_tx.h"
 #include "log.h"
 #include <ArduinoJson.h>
 
@@ -141,6 +142,11 @@ static void send_batch() {
     } else {
         LOGW("net", "uplink enqueue failed — retry after cooldown");
     }
+    // Dual-protocol: the SAME signed bytes also go out as Meshtastic packets, so a
+    // nearby mesh node can relay them. Independent of the SMOS queue — a mesh
+    // enqueue failure must never hold up the SENSMOS path (and vice versa).
+    if (mesh_tx_enabled() && !mesh_uplink_enqueue(g_tx_scratch, flen))
+        LOGW("net", "mesh enqueue failed — previous mesh batch still in flight");
     // Tethered debugging: the same signed batch on the serial console.
     ws_client_send_raw(g_tx_scratch);
 }

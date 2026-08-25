@@ -7,6 +7,7 @@
 #include "identity.h"
 #include "ble_config.h"
 #include "lora_scan.h"
+#include "mesh_tx.h"
 #include "ws_client.h"
 #include "config.h"
 #include <ArduinoJson.h>
@@ -169,6 +170,27 @@ static void cmd_lora_cfg(JsonDocument& doc, const char* cmd) {
     serial_respond("ok", cmd);
 }
 
+// set_mesh_cfg — Meshtastic dual-protocol settings.
+// {"cmd":"set_mesh_cfg","enabled":true,"channel":"LongFast","psk":"AQ==","portnum":1}
+// psk: base64 16/32-byte key, or the one-byte index form ("AQ==" = default key).
+static void cmd_set_mesh_cfg(JsonDocument& doc, const char* cmd) {
+    const bool     en = doc["enabled"]  | true;
+    const char*    ch = doc["channel"];
+    const char*    pk = doc["psk"];
+    const uint32_t pn = doc["portnum"]  | 0UL;
+    if (!mesh_tx_configure(en, ch, pk, pn)) { serial_respond("error", cmd, "bad_psk"); return; }
+    serial_respond("ok", cmd);
+}
+
+static void cmd_get_mesh_cfg(JsonDocument& doc, const char* cmd) {
+    String st;
+    mesh_tx_status_json(st);
+    char resp[320];
+    snprintf(resp, sizeof(resp),
+        "{\"status\":\"ok\",\"cmd\":\"get_mesh_cfg\",\"mesh\":%s}", st.c_str());
+    Serial.printf("[serial] %s\n", resp);
+}
+
 static void cmd_help(JsonDocument& doc, const char* cmd) {
     Serial.println("\n[serial] JSON commands (same protocol as BLE):");
     Serial.println("  {\"cmd\":\"get_info\"} | {\"cmd\":\"get_token\"} | {\"cmd\":\"send_now\"}");
@@ -177,6 +199,7 @@ static void cmd_help(JsonDocument& doc, const char* cmd) {
     Serial.println("  {\"cmd\":\"set_device_id\",\"id\":\"<64 hex>\"} | {\"cmd\":\"set_pin\",\"pin\":\"...\"}");
     Serial.println("  {\"cmd\":\"lora_cfg\",\"channels\":[{\"freq\":868.1,\"sf\":7}]}");
     Serial.println("  {\"cmd\":\"lora\",\"do\":\"status|sweep|camp|listen|cad|hunt|bg\"}");
+    Serial.println("  {\"cmd\":\"get_mesh_cfg\"} | {\"cmd\":\"set_mesh_cfg\",\"enabled\":true,\"channel\":\"LongFast\",\"psk\":\"AQ==\"}");
     Serial.println("  {\"cmd\":\"factory_reset\"} | {\"cmd\":\"done\"} | {\"cmd\":\"help\"}\n");
 }
 
@@ -227,6 +250,8 @@ static const CmdEntry CMD_TABLE[] = {
     { "lora_cfg",        cmd_lora_cfg },
 #if LORA_ENABLED
     { "lora",            cmd_lora },
+    { "set_mesh_cfg",    cmd_set_mesh_cfg },
+    { "get_mesh_cfg",    cmd_get_mesh_cfg },
 #endif
 };
 
