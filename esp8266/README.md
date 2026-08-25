@@ -33,8 +33,16 @@ BLE flow:
 4. Enter your WiFi credentials, backend URL, and owner wallet address
 5. Submit — the node saves config, restarts, and connects to your WiFi
 
-The existing Sensmos mobile app (BLE-based) is not compatible with ESP8266 nodes.
-Captive-portal support for the app is tracked separately.
+The `register` command also accepts an optional **`lat`/`lon`** pair (the onboarding phone's
+GPS), so the app can set the node's location during provisioning. When present it is stored via
+the same path as the serial `set_location` command, tagged with the WiFi SSID being provisioned
+so the boot-time IP-geolocation does not overwrite it. `ssid` is optional: if omitted while the
+node already has WiFi configured, `register` updates only the location (a phone can re-set the
+node's position without re-entering the WiFi password).
+
+The Sensmos mobile app (`frynetworks/sensmos-app`) now has a **WiFi Portal** onboarding path
+that drives exactly this: it joins the node's SoftAP, `auth`s with the portal PIN, and POSTs
+`register` with the home WiFi credentials plus the phone GPS.
 
 ### Registration payload
 
@@ -115,6 +123,22 @@ tools/
   signal (the client must join the node's AP), not as the BLE timing channel.
 * Over-the-air portal interaction was verified structurally (routes, page size, DNS catch-all) and
   by compile + hardware boot; the browser flow itself is a manual test.
+
+### Ghost-session resilience (2026-08-25)
+
+The backend retains a WS session for a device_id for ~35 s after an unclean close and withholds
+the `identified` reply to a reconnecting node until the old session is reaped. Two fixes:
+
+* **Prevention — clean close before reboot.** Reboot-bearing teardowns (`on_reboot`, `on_deleted`)
+  now call `ws_client_graceful_close()` (a WebSocket close frame, code 1000) before `ESP.restart()`
+  — a hard reset runs no destructors, so without this the server never sees a close and keeps the
+  session. (WiFi-loss / boot-failure reboots are excluded: the link is already down, so no close
+  frame can be sent.)
+* **Recovery — identify timeout.** There was no application-level timeout on the `identified`
+  reply; the protocol heartbeat stays green even when the backend withholds it, so a node could
+  wait forever with `ws=down`. `ws_client_tick()` now tracks the identify send time and, if no
+  `identified` arrives within a growing window (12 s → cap 36 s, covering the reap window), forces
+  a reconnect for a fresh identify.
 
 ## ESP8266 Hardware Specifications & Memory Budget
 

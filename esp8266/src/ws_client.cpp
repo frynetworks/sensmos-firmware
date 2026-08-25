@@ -31,6 +31,16 @@ static bool             g_ws_connected = false;
 static unsigned long    g_last_reconnect = 0;
 #define RECONNECT_INTERVAL 5000
 
+// Ghost-session resilience: WS moze wstac + odpowiadac na WS-ping, ale BE NIGDY nie
+// przyśle "identified" (przetrzymuje starą sesję dla tego device_id ~35s po brudnym
+// zamknięciu) → g_ws_connected wisi false na zawsze. Brak app-level timeoutu na
+// identify. Śledzimy moment wysłania identify; jeśli po IDENTIFY_TIMEOUT_MS nadal
+// !connected → ws.disconnect() (wymusza reconnect + świeży identify), z narastającym
+// backoffem. Reap-okno BE ~35s, więc timeout musi je pokryć w kilku próbach.
+static unsigned long s_identify_sent_ms = 0;
+static uint8_t       s_identify_tries   = 0;
+#define IDENTIFY_TIMEOUT_MS 12000UL
+
 // Nonce sesji wygenerowany w send_identify — pół soli klucza (druga połowa: be_nonce z identified).
 static uint8_t s_fw_nonce[16] = {0};
 // JEDEN bufor enc (loop-only) dla TX i RX — oszczędza ~3KB .bss. Bezpieczne bo half-duplex w loop:
@@ -115,7 +125,17 @@ static void send_identify() {
     String packet;
     serializeJson(doc, packet);
     ws.sendTXT(packet);
+    s_identify_sent_ms = millis();   // start zegara odpowiedzi (ghost-session guard)
     LOGD("ws", "identify sent (%dB)", packet.length());
+}
+
+// Czyste zamknięcie WS (ramka close 1000) PRZED ESP.restart() — twardy reset nie
+// woła destruktorów, więc bez tego BE nie widzi close i trzyma sesję-ducha ~35s.
+void ws_client_graceful_close() {
+    if (ws.isConnected()) {
+        ws.disconnect();
+        delay(50);   // daj ramce close wyjść na drut przed restartem
+    }
 }
 
 // ── Zapis danych subskrypcji do entity_store ──────────────────
@@ -173,6 +193,8 @@ static void on_identified(JsonDocument& doc) {
     if (!ws_enc_derive(s_fw_nonce, be_nonce)) { LOGE("ws", "key derive failed - disconnecting"); ws.disconnect(); return; }
 
     g_ws_connected = true;
+    s_identify_sent_ms = 0;   // odpowiedź przyszła — rozbrój ghost-guard
+    s_identify_tries   = 0;
     node_integration_push("ws_connected", "{}");
 
     // 0.64: udany identify = BE zna device i wpuścił → onboarding potwierdzony.
@@ -253,6 +275,7 @@ static bool cmd_enc_guard(const char* type) {
 static void on_reboot(JsonDocument& doc) {
     if (!cmd_enc_guard("reboot")) return;
     LOGW("ws", "remote reboot — restarting");
+    ws_client_graceful_close();   // ramka close → BE reapuje sesję od razu (bez ducha)
     delay(300);
     ESP.restart();
 }
@@ -263,6 +286,7 @@ static void on_deleted(JsonDocument& doc) {
     if (!cmd_enc_guard("deleted")) return;
     LOGW("ws", "owner deleted node — entering BLE onboarding (identity kept)");
     node_deleted_set(true);
+    ws_client_graceful_close();   // ramka close → BE reapuje sesję od razu (bez ducha)
     delay(300);
     ESP.restart();
 }
@@ -420,6 +444,7 @@ static void wsEvent(WStype_t event, uint8_t* payload, size_t length) {
             break;
         case WStype_DISCONNECTED:
             g_ws_connected = false;
+            s_identify_sent_ms = 0;   // socket padł — zegar identify nieaktualny
             ws_enc_reset();   // świeży klucz przy następnym handshake
             if (payload && length) LOGW("ws", "disconnected: %.*s", (int)length, (char*)payload);
             else                   LOGW("ws", "disconnected");
@@ -507,6 +532,20 @@ bool ws_client_send_raw(const char* json_msg) {
 bool ws_client_connected() { return g_ws_connected; }
 void ws_client_tick() {
     ws.loop();
+    // Ghost-session guard: identify wyszedł, BE milczy (trzyma starą sesję) → po
+    // narastającym timeoucie zrywamy socket, żeby lib zrobił świeży reconnect+identify.
+    // Backoff: 12s, +tries*6s, cap 36s — pokrywa reap-okno BE (~35s) w ~3 próbach.
+    if (!g_ws_connected && s_identify_sent_ms) {
+        unsigned long wait = IDENTIFY_TIMEOUT_MS + (unsigned long)s_identify_tries * 6000UL;
+        if (wait > 36000UL) wait = 36000UL;
+        if (millis() - s_identify_sent_ms > wait) {
+            LOGW("ws", "identify unanswered %lums (try %u) — forcing reconnect heap=%uk",
+                 wait, (unsigned)s_identify_tries, ESP.getFreeHeap() / 1024);
+            s_identify_sent_ms = 0;
+            if (s_identify_tries < 250) s_identify_tries++;
+            ws.disconnect();   // → WStype_DISCONNECTED → 5s reconnect → świeży identify
+        }
+    }
     if (s_geo_push_pending && g_ws_connected) {   // poza handle_message() — heap już zwolniony
         s_geo_push_pending = false;
         geoloc_push_ws();

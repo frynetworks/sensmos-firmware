@@ -18,6 +18,7 @@
  */
 #include "ble_config.h"
 #include "wifi_manager.h"
+#include "geolocation.h"       // geoloc_store — lokalizacja z telefonu przez portal
 #include "identity.h"
 #include "log.h"
 #include "http_internal.h"     // extern WebServer server (rejestracja trasy LAN po WiFi)
@@ -276,19 +277,44 @@ static void process_cmd(const char* body) {
         const char* ssid        = doc["ssid"];
         const char* password    = doc["password"] | "";
 
-        if (!ssid || !strlen(ssid))                  { send_err(cmd, "missing_ssid"); return; }
+        // ssid opcjonalny: pusty + WiFi juz skonfigurowane => aktualizacja SAMEJ lokalizacji
+        // (telefon ustawia GPS bez wpisywania hasla WiFi). Z ssid => pelne provisionowanie.
+        bool have_ssid = ssid && strlen(ssid);
+        if (!have_ssid && !wifi_has_config())        { send_err(cmd, "missing_ssid"); return; }
         if (strlen(owner) && strlen(owner) != 42)    { send_err(cmd, "bad_owner"); return; }
 
         strncpy(g_owner_address, owner,               sizeof(g_owner_address)-1);
         strncpy(g_backend_url,   DEFAULT_BACKEND_URL, sizeof(g_backend_url)-1);
-        wifi_save_config(ssid, password);
-        LOGI("portal", "config: backend=%s ssid=%s owner=%s", g_backend_url, ssid,
-             strlen(owner) ? owner : "(unclaimed)");
+        if (have_ssid) wifi_save_config(ssid, password);   // bez ssid: zostaja obecne creds
+        yield();   // karm WDT: handler robi 4 namespace'y NVS + ECDSA bez feedu → HW WDT
+
+        // Lokalizacja z telefonu (opcjonalna) — PO wifi_save_config, z KANONICZNYM
+        // g_wifi_ssid (przycietym). geoloc_boot_attempt trzyma manualna lokalizacje tylko
+        // gdy zapisany ssid == g_wifi_ssid po reboot'cie; uzycie surowego ssid z JSON
+        // (nieprzyciety) grozilo niedopasowaniem → IP-geoloc nadpisywalby GPS telefonu.
+        if (doc["lat"].is<float>() && doc["lon"].is<float>()) {
+            float lat = doc["lat"] | 999.0f;
+            float lon = doc["lon"] | 999.0f;
+            if (lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f &&
+                !(lat == 0.0f && lon == 0.0f)) {
+                uint32_t acc = doc["acc"] | 10;
+                char latS[16], lonS[16];
+                snprintf_P(latS, sizeof(latS), PSTR("%.6f"), (double)lat);
+                snprintf_P(lonS, sizeof(lonS), PSTR("%.6f"), (double)lon);
+                if (geoloc_store(latS, lonS, acc, "manual", g_wifi_ssid))
+                    LOGI("portal", "location set from phone: lat=%s lon=%s acc=%um",
+                         latS, lonS, (unsigned)acc);
+            }
+            yield();
+        }
+        LOGI("portal", "config: backend=%s ssid=%s owner=%s", g_backend_url,
+             have_ssid ? ssid : "(kept)", strlen(owner) ? owner : "(unclaimed)");
 
         Preferences p; p.begin("sensmos", false);
         p.putString("owner_addr",  owner);
         p.putString("backend_url", DEFAULT_BACKEND_URL);
         p.end();
+        yield();
 
         // Challenge-Response — message podpisywany dokładnie jak w BLE
         char* message = s_buf.reg.message;
@@ -298,12 +324,14 @@ static void process_cmd(const char* body) {
 
         uint8_t msg_hash[32];
         sha256_string(message, msg_hash);
+        yield();
 
         uint8_t sig_raw[72]; size_t sig_len = 0;
         char* sig_esp_hex = s_buf.reg.sig_esp_hex; sig_esp_hex[0] = 0;
-        if (identity_sign(msg_hash, sig_raw, &sig_len)) {
+        if (identity_sign(msg_hash, sig_raw, &sig_len)) {   // ECDSA secp256k1 — najdłuższy krok
             bytes_to_hex(sig_raw, sig_len, sig_esp_hex);
         }
+        yield();
 
         char* pubkey_hex = s_buf.reg.pubkey_hex;
         identity_get_pubkey_hex(pubkey_hex, sizeof(s_buf.reg.pubkey_hex));
@@ -334,6 +362,7 @@ static void process_cmd(const char* body) {
             pp.putString("reg_payload", payload);
             pp.end();
         }
+        yield();
 
         LOGD("portal", "register resp: %d B", (int)strlen(resp));
         send_json(resp);
