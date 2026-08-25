@@ -286,7 +286,8 @@ static void process_cmd(const char* body) {
         strncpy(g_owner_address, owner,               sizeof(g_owner_address)-1);
         strncpy(g_backend_url,   DEFAULT_BACKEND_URL, sizeof(g_backend_url)-1);
         if (have_ssid) wifi_save_config(ssid, password);   // bez ssid: zostaja obecne creds
-        yield();   // karm WDT: handler robi 4 namespace'y NVS + ECDSA bez feedu → HW WDT
+        optimistic_yield(1000);   // feed WDT: handler does 4 NVS namespaces + ECDSA. optimistic_yield
+        // (NOT raw yield): NVS = flash writes with interrupts locked → can_yield()==false → raw yield panics.
 
         // Lokalizacja z telefonu (opcjonalna) — PO wifi_save_config, z KANONICZNYM
         // g_wifi_ssid (przycietym). geoloc_boot_attempt trzyma manualna lokalizacje tylko
@@ -305,7 +306,7 @@ static void process_cmd(const char* body) {
                     LOGI("portal", "location set from phone: lat=%s lon=%s acc=%um",
                          latS, lonS, (unsigned)acc);
             }
-            yield();
+            optimistic_yield(1000);
         }
         LOGI("portal", "config: backend=%s ssid=%s owner=%s", g_backend_url,
              have_ssid ? ssid : "(kept)", strlen(owner) ? owner : "(unclaimed)");
@@ -314,7 +315,7 @@ static void process_cmd(const char* body) {
         p.putString("owner_addr",  owner);
         p.putString("backend_url", DEFAULT_BACKEND_URL);
         p.end();
-        yield();
+        optimistic_yield(1000);
 
         // Challenge-Response — message podpisywany dokładnie jak w BLE
         char* message = s_buf.reg.message;
@@ -324,14 +325,14 @@ static void process_cmd(const char* body) {
 
         uint8_t msg_hash[32];
         sha256_string(message, msg_hash);
-        yield();
+        optimistic_yield(1000);
 
         uint8_t sig_raw[72]; size_t sig_len = 0;
         char* sig_esp_hex = s_buf.reg.sig_esp_hex; sig_esp_hex[0] = 0;
         if (identity_sign(msg_hash, sig_raw, &sig_len)) {   // ECDSA secp256k1 — najdłuższy krok
             bytes_to_hex(sig_raw, sig_len, sig_esp_hex);
         }
-        yield();
+        optimistic_yield(1000);
 
         char* pubkey_hex = s_buf.reg.pubkey_hex;
         identity_get_pubkey_hex(pubkey_hex, sizeof(s_buf.reg.pubkey_hex));
@@ -354,7 +355,14 @@ static void process_cmd(const char* body) {
         // ZAŁOŻENIE PORTU: klient portalu nie ma internetu → payload rejestracyjny
         // persystowany; po WiFi dostępny pod GET /node/reg-payload (LAN).
         {
-            char payload[900];
+            // STATIC, not stack: a 900 B local here overflowed the ~4 KB cont stack —
+            // the register path is already deep (handleClient → process_cmd) and the
+            // Preferences/littlefs commit recurses (lfs_dir_orphaningcommit →
+            // relocatingcommit → traverse), giving Exception(0) (illegal instruction,
+            // corrupted return address) under the portal's low heap. Off-stacking this
+            // buffer restores the headroom the littlefs commit needs. Handler is
+            // single-request, so a function-static buffer is safe (not re-entrant).
+            static char payload[900];
             snprintf_P(payload, sizeof(payload),
                 PSTR("{\"message\":%s,\"sig_esp\":\"%s\",\"pubkey_esp\":\"%s\",\"proof\":\"%s\"}"),
                 message, sig_esp_hex, pubkey_hex, proof_hex);
@@ -362,7 +370,7 @@ static void process_cmd(const char* body) {
             pp.putString("reg_payload", payload);
             pp.end();
         }
-        yield();
+        optimistic_yield(1000);
 
         LOGD("portal", "register resp: %d B", (int)strlen(resp));
         send_json(resp);
@@ -657,19 +665,25 @@ void ble_tick() {
     // Portal-under-load HW WDT (rst cause:4): when a phone associates to the
     // SoftAP it floods captive-portal detection (a DNS burst + several parallel
     // TCP probes). The NONOS SDK/lwIP path servicing association+DHCP+DNS+TCP can
-    // monopolise the CPU; yield() below returns INTO the SDK and hands it more
-    // service windows per loop pass — the only sketch-side lever. The ~8.4s
-    // hardware WDT has no direct feed API, so a true SDK-side stall is not fully
-    // curable from the sketch; these bounded yields shrink the window, not a cure.
+    // monopolise the CPU; handing the SDK more service windows per loop pass is
+    // the only sketch-side lever. MUST use optimistic_yield(), NOT raw yield():
+    // during the storm (and during the register handler's NVS flash writes) a
+    // critical section is often active, so can_yield() is false and a raw yield()
+    // aborts with `Panic core_esp8266_main.cpp __yield` (observed on device,
+    // rst cause:2). optimistic_yield() checks can_yield()/critical-section
+    // internally and no-ops when unsafe, so it feeds when it can and never panics.
+    // With the register handler no longer crashing (optimistic_yield + off-stack
+    // payload buffer, see below), these bounded yields keep the loop fed through
+    // the storm — device-verified: full onboarding with no rst cause:4/2 crash.
     if (s_dns) {
         for (int i = 0; i < 8; i++) {   // drain the DNS burst, bounded + fed
             s_dns->processNextRequest();
-            yield();
+            optimistic_yield(1000);
         }
     }
-    yield();
+    optimistic_yield(1000);
     if (s_srv) s_srv->handleClient();
-    yield();
+    optimistic_yield(1000);
 
     if (s_restart_at_ms && millis() > s_restart_at_ms) {   // factory_reset — po wysłaniu odpowiedzi
         delay(200); ESP.restart();

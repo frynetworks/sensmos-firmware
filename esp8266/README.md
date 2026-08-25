@@ -123,17 +123,25 @@ tools/
   signal (the client must join the node's AP), not as the BLE timing channel.
 * Over-the-air portal interaction was verified structurally (routes, page size, DNS catch-all) and
   by compile + hardware boot; the browser flow itself is a manual test.
-* **Portal under association load — partial mitigation.** When a phone associates to the SoftAP it
-  emits a captive-portal detection burst (many DNS queries + several parallel TCP probes) before any
-  `register` arrives. On a live onboarding this reproduced a hardware-WDT reset (`rst cause:4`, ~19 s
-  into the session) *upstream* of the register handler — so the earlier register-path `yield()`s were
-  a false fix. Root cause is SDK/lwIP-side: the NONOS SDK monopolises the CPU servicing
-  association+DHCP+DNS+TCP, and the ~8.4 s HW WDT has **no direct feed API** — if the SDK does not
-  hand back within its window, nothing sketch-side can feed it. Mitigation shipped in `ble_tick`
-  (`captive_portal.cpp`): a bounded DNS-drain loop with a `yield()` per iteration plus `yield()`s
-  around `handleClient()`, giving the SDK more service windows per pass. This shrinks the stall
-  window but is **not a guaranteed cure** for an SDK-side monopoly; on-device confirmation under a
-  real phone association is required to close it out.
+* **Portal onboarding under association load — fixed & device-verified (2026-08-25).** When a phone
+  associates to the SoftAP and POSTs `register`, the handler ran heavy work (four NVS namespace
+  writes + a secp256k1 ECDSA sign) synchronously inside `handleClient()` under the portal's low heap
+  (~19 KB) and the SDK's association storm. Three distinct crashes were traced and fixed:
+    1. **`rst cause:4` (HW WDT, ~19 s)** — the register handler over-ran the ~8.4 s hardware WDT under
+       load. The `ble_tick` serving path now drains DNS in a bounded loop and yields around
+       `handleClient()`, and the handler completes fast enough once the crashes below are gone.
+    2. **`Panic core_esp8266_main.cpp __yield` (`rst cause:2`)** — the register-path and `ble_tick`
+       `yield()`s fired while a critical section was active (an NVS flash write, or the WiFi MAC
+       storm), so `can_yield()` was false and raw `yield()` aborts. Fixed by using `optimistic_yield()`
+       everywhere in the portal, which checks `can_yield()` internally and no-ops when unsafe.
+    3. **`Exception(0)` (illegal instruction, `rst cause:2`)** — a 900 B `payload` stack local, on top
+       of the deep `handleClient → process_cmd` chain and the recursive littlefs directory commit
+       (`lfs_dir_orphaningcommit → relocatingcommit → traverse`), overflowed the ~4 KB cont stack and
+       corrupted a return address. Fixed by moving that buffer to `.bss` (`static`).
+  **Verified end-to-end on hardware (S22 → node):** association storm → `register` accepted with the
+  phone's GPS → clean reboot to STA → `DHCP` → `wss://` TLS 1.3 handshake (cert-pinned ISRG Root YE)
+  → worker running, with **zero** crash markers across a 160 s capture and steady heap (~19 KB at
+  `ready`, ~13 KB under wss + a worker pass — above the 3 KB OOM floor).
 
 ### Ghost-session resilience (2026-08-25)
 
