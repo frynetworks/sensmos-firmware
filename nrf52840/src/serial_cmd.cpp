@@ -93,14 +93,18 @@ static void cmd_unregister(JsonDocument& doc, const char* cmd) {
 static void cmd_get_info(JsonDocument& doc, const char* cmd) {
     char pubkey_hex[131];
     identity_get_pubkey_hex(pubkey_hex, sizeof(pubkey_hex));
-    char lora[224]; String ls;
+    // resp/lora are static (.bss), NOT stack: this handler runs in the 4 KB FreeRTOS
+    // loop-task stack (shared with SoftDevice) and the get_info chain (resp[720] + lora[224]
+    // + lora_link_status_json's b[288] + newlib vsnprintf) overran it → hard fault. The loop
+    // task is single-threaded, so a function-static buffer is safe (not reentrant).
+    static char lora[224]; String ls;
     lora[0] = 0;
     if (lora_available()) {
         lora_link_status_json(ls);
         snprintf(lora, sizeof(lora), ",\"lora_board\":\"%s\",\"lora_link\":%s",
                  lora_board_name(), ls.c_str());
     }
-    char resp[720];
+    static char resp[720];
     snprintf(resp, sizeof(resp),
         "{\"status\":\"ok\",\"cmd\":\"get_info\","
         "\"device_id\":\"%s\","
@@ -113,7 +117,12 @@ static void cmd_get_info(JsonDocument& doc, const char* cmd) {
         g_device_id, g_eth_address, g_owner_address, pubkey_hex,
         strlen(g_owner_address) > 0 ? "true" : "false",
         ws_epoch_synced() ? "true" : "false", lora);
-    Serial.printf("[serial] %s\n", resp);
+    // Emit with direct writes, NOT Serial.printf("%s", resp): re-formatting the ~450-byte
+    // response through Print::printf's internal vararg buffer corrupted the tail (dumped RAM
+    // past ~264 B). Serial.print(const char*) writes the bytes straight to the CDC, chunked.
+    Serial.print("[serial] ");
+    Serial.println(resp);
+    Serial.flush();
 }
 
 static void cmd_get_token(JsonDocument& doc, const char* cmd) {

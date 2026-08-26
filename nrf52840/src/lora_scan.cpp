@@ -1006,7 +1006,7 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
 bool lora_link_on() { return s_link.on; }
 
 void lora_link_status_json(String& out) {
-    char b[288];                             // grew with the per-band duty fields
+    static char b[288];                      // static (.bss), not stack — embedded in get_info's 4KB loop-task chain
     uint32_t now = ws_epoch_now();
     // duty_ms_h stays as the g1 figure so anything reading the old field keeps seeing
     // the SENSMOS band it always meant; g1_ms/g4_ms carry the per-band split. Keys are
