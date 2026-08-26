@@ -193,7 +193,17 @@ int WsTlsClient::tlsConnect(IPAddress ip, uint16_t port, const char* sniHost) {
     }
     ws_tls_print_heap("post-tcp-connect");
 
+#ifdef MMU_IRAM_HEAP
+    // Route the ~2.9 KB _ssl (WOLFSSL obj + I/O buffers) to the idle IRAM second heap so the DRAM
+    // max-free-block stays large for the P-384 chain verify inside wolfSSL_connect (which runs
+    // OUTSIDE this scope → its verify temporaries stay on DRAM → fast, no HW-WDT risk from slow
+    // IRAM crypto). Fixes handshake err=-155 (ASN_SIG_CONFIRM_E) that hit when the DRAM block dipped
+    // ~10.7k, just under the ~11k the SP_384 verify needs. free() is address-routed, so later DRAM
+    // wolfSSL_read/write frees stay correct; low-traffic wss makes the IRAM I/O-buffer cost trivial.
+    { HeapSelectIram ephemeral; _ssl = wolfSSL_new(g_ctx); }
+#else
     _ssl = wolfSSL_new(g_ctx);
+#endif
     if (!_ssl) {
         LOGE("tls", "SSL_new failed");
         WiFiClient::stop();

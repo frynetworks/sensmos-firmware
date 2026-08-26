@@ -146,6 +146,7 @@ static void send_ok(const char* cmd) {
     send_json(b);
 }
 static void send_err(const char* cmd, const char* msg) {
+    LOGW("portal", "reject cmd=%s: %s", cmd, msg);   // always-visible: onboarding failures self-explain on serial
     char b[96]; snprintf_P(b, sizeof(b), PSTR("{\"status\":\"error\",\"cmd\":\"%s\",\"msg\":\"%s\"}"), cmd, msg);
     send_json(b);
 }
@@ -280,6 +281,9 @@ static void process_cmd(const char* body) {
         // ssid opcjonalny: pusty + WiFi juz skonfigurowane => aktualizacja SAMEJ lokalizacji
         // (telefon ustawia GPS bez wpisywania hasla WiFi). Z ssid => pelne provisionowanie.
         bool have_ssid = ssid && strlen(ssid);
+        LOGI("portal", "register recv: ssid=%s owner_len=%u lat/lon=%d",
+             have_ssid ? ssid : "(none)", (unsigned)strlen(owner),
+             (doc["lat"].is<float>() && doc["lon"].is<float>()) ? 1 : 0);
         if (!have_ssid && !wifi_has_config())        { send_err(cmd, "missing_ssid"); return; }
         if (strlen(owner) && strlen(owner) != 42)    { send_err(cmd, "bad_owner"); return; }
 
