@@ -542,6 +542,13 @@ static volatile bool s_link_be_on = LORA_LINK_DEFAULT;
 
 static int      s_cur_ch   = -1;         // indeks kanału, na którym stoi radio
 
+// Kanal, ktorego radio nie przyjmuje (np. bledne parametry FSK -> beginFSK = -102).
+// Po LORA_CFG_FAIL_MAX nieudanych probach przestajemy blokowac na nim cala petle.
+#define LORA_CFG_FAIL_MAX 3
+static uint8_t  s_cfg_fail     = 0;
+static int      s_cfg_fail_idx = -1;
+static bool     s_ch_broken    = false;
+
 // ── Duty cycle, ODDZIELNIE dla kazdego podpasma regionu ──────────────────────
 // Jeden licznik na node bylby zly w OBIE strony: dlawilby ruch, ktory na swoim pasmie
 // jest wciaz legalny, a jednoczesnie ukrylby przekroczenie, gdyby zsumowac dwa pasma.
@@ -956,7 +963,25 @@ static void link_tick() {
         else
             LOGI("lora", "link: channel -> %.3f MHz SF%u BW%.0f sync 0x%02X (slot %u)",
                  c.freq, c.sf, c.bw, c.sync, s_link.slot);
-        if (!cfg_ch(c)) { delay(1000); return; }
+        // Radio odmowilo tego kanalu (zle parametry FSK daja -102). Ponawianie w
+        // nieskonczonosc zaglodzilo WSZYSTKO: link_tick wracal tutaj, wiec przez cale okno
+        // postoju nie leciał ani beacon, ani uplink, ani Meshtastic — i nawet linia
+        // "tylko do nasluchu" sie nie pojawiala. Po kilku probach uznajemy kanal za zajety,
+        // ale NIEUZYWALNY: TX SENSMOS zostaje wstrzymany (s_ch_broken wymusza tx_ok=false),
+        // a mesh — ktory i tak przestraja radio sam — leci dalej.
+        if ((int)idx != s_cfg_fail_idx) { s_cfg_fail_idx = (int)idx; s_cfg_fail = 0; }
+        if (!cfg_ch(c)) {
+            if (++s_cfg_fail < LORA_CFG_FAIL_MAX) { delay(1000); return; }
+            if (s_cfg_fail == LORA_CFG_FAIL_MAX)
+                LOGW("lora", "cfg_ch nieudane %ux na %.4f MHz (mode %u) — kanal nieuzywalny, "
+                     "TX SENSMOS wstrzymany na to okno; mesh dziala dalej",
+                     s_cfg_fail, c.freq, c.mode);
+            s_ch_broken = true;
+            s_cur_ch = (int)idx;
+            delay(1000);
+            return;
+        }
+        s_cfg_fail = 0; s_ch_broken = false;
         // begin() zostawia radio w standby — bez tego pomiar leciał na wyłączonym
         // odbiorniku i KAŻDY kanał raportował −128 dBm (podłoga skali, nie cisza w eterze).
         s_irq = false;
@@ -993,7 +1018,9 @@ static void link_tick() {
     // zachowanie istnialo, zanim doszedl region; walidacja planu tylko je obnazyla.
     // Dotyczy WYLACZNIE nadawania SENSMOS (beacon + uplink SMOSB), bo tylko one nadaja
     // NA TYM kanale. Meshtastic ma osobna bramke nizej — patrz komentarz tamze.
-    const bool tx_ok = ch_tx_allowed(c);
+    // s_ch_broken: radio nie przyjelo konfiguracji tego kanalu, wiec nadawanie na nim
+    // byloby nadawaniem w nieznanym stanie.
+    const bool tx_ok = !s_ch_broken && ch_tx_allowed(c);
     if (!tx_ok) {
         static int warned_ch = -2;
         if (warned_ch != s_cur_ch) {

@@ -529,6 +529,13 @@ static struct {
 
 static int      s_cur_ch   = -1;         // indeks kanału, na którym stoi radio
 
+// A channel the radio refuses (bad FSK parameters make beginFSK answer -102). After
+// LORA_CFG_FAIL_MAX attempts we stop letting it block the whole loop.
+#define LORA_CFG_FAIL_MAX 3
+static uint8_t  s_cfg_fail     = 0;
+static int      s_cfg_fail_idx = -1;
+static bool     s_ch_broken    = false;
+
 // ── Duty cycle, per EU868 sub-band ───────────────────────────────────────────
 // One counter per sub-band, not one per node: g1 (868.0-868.6) allows 1% and g4
 // (869.4-869.65) allows 10%, so charging Meshtastic's SF11 airtime to the SMOS
@@ -964,7 +971,24 @@ static void link_tick() {
         else
             LOGI("lora", "link: channel -> %.3f MHz SF%u BW%.0f sync 0x%02X (slot %u)",
                  c.freq, c.sf, c.bw, c.sync, s_link.slot);
-        if (!cfg_ch(c)) { delay(1000); return; }
+        // The radio refused this channel (bad FSK parameters give -102). Retrying forever
+        // starved EVERYTHING: link_tick returned here, so for the whole dwell there was no
+        // beacon, no uplink, no Meshtastic TX — not even the "listen-only" line. After a few
+        // attempts we accept the channel as camped but UNUSABLE: SENSMOS TX is held
+        // (s_ch_broken forces tx_ok false) while mesh, which retunes the radio itself, runs on.
+        if ((int)idx != s_cfg_fail_idx) { s_cfg_fail_idx = (int)idx; s_cfg_fail = 0; }
+        if (!cfg_ch(c)) {
+            if (++s_cfg_fail < LORA_CFG_FAIL_MAX) { delay(1000); return; }
+            if (s_cfg_fail == LORA_CFG_FAIL_MAX)
+                LOGW("lora", "cfg_ch failed %ux on %.4f MHz (mode %u) — channel unusable, "
+                     "SENSMOS TX held for this dwell; mesh continues",
+                     s_cfg_fail, c.freq, c.mode);
+            s_ch_broken = true;
+            s_cur_ch = (int)idx;
+            delay(1000);
+            return;
+        }
+        s_cfg_fail = 0; s_ch_broken = false;
         // begin() zostawia radio w standby — bez tego pomiar leciał na wyłączonym
         // odbiorniku i KAŻDY kanał raportował −128 dBm (podłoga skali, nie cisza w eterze).
         s_irq = false;
@@ -1004,7 +1028,9 @@ static void link_tick() {
     // brought it to light.
     // Applies ONLY to SENSMOS transmissions (beacon + SMOSB uplink), because only those go
     // out ON THIS channel. Meshtastic has its own gate below — see the comment there.
-    const bool tx_ok = ch_tx_allowed(c);
+    // s_ch_broken: the radio never accepted this channel's configuration, so transmitting
+    // on it would mean transmitting from an unknown state.
+    const bool tx_ok = !s_ch_broken && ch_tx_allowed(c);
     if (!tx_ok) {
         static int warned_ch = -2;
         if (warned_ch != s_cur_ch) {

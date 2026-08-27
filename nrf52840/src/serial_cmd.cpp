@@ -12,6 +12,7 @@
 #include "config.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <stdlib.h>       // strtoul — FSK sync bytes arrive as a hex string
 
 static String serial_buffer = "";
 
@@ -173,6 +174,28 @@ static void cmd_lora_cfg(JsonDocument& doc, const char* cmd) {
         chans[n].cr   = c["cr"]   | 5;
         chans[n].sync = c["sync"] | 0x34;
         chans[n].mode = c["mode"] | 0;
+        // FSK channels need br/dev/sync-bytes/flags, and this parser used to ignore them:
+        // a mode-1 channel provisioned over serial arrived with br = 0, beginFSK() answered
+        // RADIOLIB_ERR_INVALID_BIT_RATE (-102), and link_tick then retried cfg_ch forever
+        // without ever advancing — the whole dwell went silent. Field names and semantics
+        // are transcribed from the WS parser (src/ws_client.cpp) so ONE plan JSON behaves
+        // identically over both transports; diverging here is what created the gap.
+        if (chans[n].mode == 1) {
+            chans[n].br    = c["br"]  | 4.8f;
+            chans[n].dev   = c["dev"] | 5.0f;
+            chans[n].len   = (uint8_t)(c["len"] | 0);
+            chans[n].flags = (uint8_t)((c["crc"]   | 0 ? 0x01 : 0) |
+                                       (c["white"] | 0 ? 0x02 : 0) |
+                                       (c["fixed"] | 0 ? 0x04 : 0));
+            // sync as a hex STRING ("543d") — a byte sequence, not one number like LoRa.
+            const char* sh = c["syncb"] | "";
+            uint8_t k = 0;
+            for (const char* p = sh; p[0] && p[1] && k < 8; p += 2) {
+                char b[3] = { p[0], p[1], 0 };
+                chans[n].syncb[k++] = (uint8_t)strtoul(b, nullptr, 16);
+            }
+            chans[n].syncn = k;
+        }
         n++;
     }
     lora_link_set(doc["on"] | true, doc["beacon"] | true, doc["slot"] | 0,
