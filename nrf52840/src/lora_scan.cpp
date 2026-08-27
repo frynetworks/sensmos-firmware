@@ -608,6 +608,9 @@ static void region_load() {
 // Re-derives the SENSMOS channel plan after a region change. Defined further down,
 // next to lora_link_set, because it manipulates the same s_link state.
 static void region_apply_to_plan();
+// Whether a channel may be transmitted on (mode 0 + inside the region's RF envelope).
+// Defined there too; link_tick needs it earlier to hold TX on listen-only channels.
+static bool ch_tx_allowed(const LoraLinkCh& c);
 
 bool lora_region_set(const char* name) {
     if (!name || !name[0]) return false;
@@ -993,9 +996,27 @@ static void link_tick() {
 
     // Slot nadawania: sekunda 10 + k*7 w każdej minucie. Trafiamy w nią raz — seq rośnie,
     // więc podwójne wejście w tę samą sekundę wykluczamy znacznikiem ostatniej minuty.
+    // Whether transmitting on THIS channel is allowed. Without this the beacon and uplink
+    // also fired while the link was camped on a foreign-protocol listen channel (mode 1) —
+    // the radio is in FSK mode there (cfg_ch -> beginFSK), so the SMOS frame went out as
+    // FSK on a frequency we only meant to monitor: nothing could receive it and the
+    // emission was real. That behaviour predates the region work; plan validation only
+    // brought it to light.
+    // Applies ONLY to SENSMOS transmissions (beacon + SMOSB uplink), because only those go
+    // out ON THIS channel. Meshtastic has its own gate below — see the comment there.
+    const bool tx_ok = ch_tx_allowed(c);
+    if (!tx_ok) {
+        static int warned_ch = -2;
+        if (warned_ch != s_cur_ch) {
+            warned_ch = s_cur_ch;
+            LOGI("lora", "channel %.4f MHz (mode %u) is listen-only — SENSMOS TX held "
+                 "(mesh keeps transmitting on its own channel)", c.freq, c.mode);
+        }
+    }
+
     static uint32_t last_tx_min = 0;
     const uint32_t my_sec = LORA_LINK_SLOT0_S + (uint32_t)s_link.slot * LORA_LINK_SLOT_GAP_S;
-    if (s_link.beacon && sec_in_min == my_sec && (now / 60) != last_tx_min &&
+    if (tx_ok && s_link.beacon && sec_in_min == my_sec && (now / 60) != last_tx_min &&
         (s_link.beacon_s == 0 || (now % s_link.beacon_s) < 60)) {
         last_tx_min = now / 60;
         link_tx_beacon(c);
@@ -1005,7 +1026,7 @@ static void link_tick() {
     // clear of the guard window around channel rotation.
     static uint32_t last_up_sec = 61;
     bool smos_tx_this_sec = false;
-    if (s_up_pending && sec_in_min != last_up_sec &&
+    if (tx_ok && s_up_pending && sec_in_min != last_up_sec &&
         sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
         last_up_sec = sec_in_min;
         uplink_tx_next(c);
@@ -1018,6 +1039,12 @@ static void link_tick() {
     // preempts the other mid-packet. The retune is expensive (~0.7 s of SF11 airtime
     // plus two begin() calls), so it happens at most once per second and always
     // hands the radio back on the SENSMOS channel before the RX window below.
+    // DELIBERATELY without tx_ok: mesh_tx_next does NOT transmit on channel `c` — it retunes
+    // the radio to the region's own Meshtastic frequency (rg->mesh_freq, inside the RF
+    // envelope by construction) and hands it back. Tying it to the LINK channel's tx_ok
+    // withheld mesh for a whole dwell every time rotation parked on a listen-only channel —
+    // at the default 10 min/channel that is a real throughput loss on mixed plans, for no
+    // regulatory gain. Mesh has its own duty budget (mbi below) and its own band.
     static uint32_t last_mesh_sec = 61;
     if (!smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
         sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
@@ -1079,18 +1106,69 @@ static void region_default_ch(LoraLinkCh* out) {
     out->mode = 0;
 }
 
-// True when every channel of the current plan lies inside one of the region's sub-bands.
-static bool plan_is_legal() {
+// Whether this channel may be TRANSMITTED on in the current region. Both conditions
+// are required:
+//  · mode == 0 — mode 1 (FSK) channels exist purely to LISTEN to foreign protocols
+//    (wM-Bus and friends, see cfg_ch). Receiving occupies no airtime, so it carries no
+//    duty-cycle or power exposure; transmitting there would put a signal on a frequency
+//    we only meant to monitor.
+//  · frequency inside the region's RF ENVELOPE — not its duty sub-bands. The sub-bands
+//    describe accounting and deliberately do not span the whole plan (867.1 is an
+//    ordinary EU868 channel that sits outside both g1 and g4).
+static bool ch_tx_allowed(const LoraLinkCh& c) {
+    if (c.mode != 0) return false;
+    return c.freq >= REGIONS[s_region].rf_lo && c.freq <= REGIONS[s_region].rf_hi;
+}
+
+static uint8_t plan_tx_ch_count() {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < s_link.n_ch; i++) if (ch_tx_allowed(s_link.ch[i])) n++;
+    return n;
+}
+
+// Tidies the plan after a region change or a backend plan. PER CHANNEL, not by replacing
+// the whole array: wiping the array killed foreign-protocol monitoring (the FSK channels),
+// which has nothing to do with the region. Rules:
+//   · mode 1 (listen-only) channels are ALWAYS kept — no regulatory exposure;
+//   · mode 0 channels inside the region envelope are kept;
+//   · mode 0 channels outside it are DROPPED individually, each logged;
+//   · if that leaves nothing to transmit on, the region default is APPENDED so beacon and
+//     uplink have a legal home while the monitoring channels survive untouched.
+// Returns true when the plan was modified.
+static bool plan_sanitize() {
+    bool changed = false;
+    uint8_t keep = 0;
     for (uint8_t i = 0; i < s_link.n_ch; i++) {
-        const float f = s_link.ch[i].freq;
-        bool inside = false;
-        for (int b = 0; b < 2; b++) {
-            const LoraBand& band = REGIONS[s_region].band[b];
-            if (f >= band.lo && f <= band.hi) { inside = true; break; }
+        const LoraLinkCh& c = s_link.ch[i];
+        const bool rx_only = (c.mode != 0);
+        const bool in_env  = (c.freq >= REGIONS[s_region].rf_lo &&
+                              c.freq <= REGIONS[s_region].rf_hi);
+        if (rx_only || in_env) {
+            if (keep != i) s_link.ch[keep] = c;
+            keep++;
+            continue;
         }
-        if (!inside) return false;
+        LOGW("lora", "channel %.4f MHz (mode %u) is OUTSIDE the %s RF envelope (%.1f-%.1f MHz) "
+                     "— dropped from the plan", c.freq, c.mode, REGIONS[s_region].name,
+             REGIONS[s_region].rf_lo, REGIONS[s_region].rf_hi);
+        changed = true;
     }
-    return true;
+    s_link.n_ch = keep;
+
+    if (plan_tx_ch_count() == 0) {
+        if (s_link.n_ch >= LORA_LINK_MAX_CH) {
+            LOGW("lora", "plan is full (%u channels) — listen channel %.4f MHz gives way to a "
+                 "transmittable one", s_link.n_ch, s_link.ch[LORA_LINK_MAX_CH - 1].freq);
+            s_link.n_ch = LORA_LINK_MAX_CH - 1;
+        }
+        region_default_ch(&s_link.ch[s_link.n_ch]);
+        s_link.n_ch++;
+        LOGW("lora", "plan has no transmittable channel in %s — appending the default %.4f MHz "
+                     "(listen-only channels kept)", REGIONS[s_region].name,
+             REGIONS[s_region].smos_freq);
+        changed = true;
+    }
+    return changed;
 }
 
 static void install_region_default_plan() {
@@ -1109,15 +1187,14 @@ static void region_apply_to_plan() {
         install_region_default_plan();
         return;
     }
-    if (plan_is_legal()) {
+    if (plan_sanitize()) {
+        LOGW("lora", "region change: backend plan adapted to %s (%u channels, %u transmittable)",
+             REGIONS[s_region].name, s_link.n_ch, plan_tx_ch_count());
+        s_cur_ch = -1;
+    } else {
         LOGI("lora", "region change: backend plan is within %s — keeping it",
              REGIONS[s_region].name);
-        return;
     }
-    LOGW("lora", "region change: backend plan (%.4f MHz) is OUTSIDE %s — replaced with the "
-                 "region default %.4f MHz", s_link.ch[0].freq, REGIONS[s_region].name,
-         REGIONS[s_region].smos_freq);
-    install_region_default_plan();
 }
 
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
@@ -1134,16 +1211,11 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
             s_plan_from_be = true;
             // Validate HERE too, not only on set_region: the backend re-sends lora_cfg
             // after every identify, so a stale EU plan would otherwise silently undo a
-            // region switch on the very next frame.
-            if (!plan_is_legal()) {
-                LOGW("lora", "lora_cfg plan (%.4f MHz) is OUTSIDE region %s — replaced with "
-                             "the region default %.4f MHz", s_link.ch[0].freq,
-                     REGIONS[s_region].name, REGIONS[s_region].smos_freq);
-                LoraLinkCh d;
-                region_default_ch(&d);
-                s_link.ch[0] = d;
-                s_link.n_ch  = 1;
-            }
+            // region switch on the very next frame. Tidied PER CHANNEL so listen-only
+            // channels survive.
+            if (plan_sanitize())
+                LOGW("lora", "lora_cfg plan adapted to region %s (%u channels, %u transmittable)",
+                     REGIONS[s_region].name, s_link.n_ch, plan_tx_ch_count());
         } else {
             s_plan_from_be = false;
         }
