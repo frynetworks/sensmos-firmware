@@ -15,17 +15,24 @@
 #include <mbedtls/sha256.h>
 #include "lora_config.h"   // LORA_ENABLED — decyduje o targecie OTA (niżej)
 
-// Build radiowy ma WŁASNY target OTA. Bez tego jedyną drogą wydania było podmienianie
-// sensmos-esp32s3.bin, czyli chwilowe wystawienie eksperymentu CAŁEJ flocie S3 — BE nie
-// ma bina per node, wysyła całą mapę targetów i to node wybiera swój. Z osobnym kluczem
-// płytka z SX1262 nigdy nie weźmie bina floty ani odwrotnie, nawet w jednym rollout.
-#if LORA_ENABLED
-  // JEDEN target na wszystkie plytki radiowe — piny wykrywa sonda przy starcie
-  // (lora_config.h), wiec ten sam bin chodzi na XIAO, Heltecu i reszcie tablicy.
-  // Osobny od floty, bo flota nie ma czego robic z RadioLib w binie.
-  #define OTA_CHIP "esp32s3-lora"
-#elif CONFIG_IDF_TARGET_ESP32
-  #define OTA_CHIP "esp32"
+// Build radiowy ma WŁASNY target OTA per rodzina chipu. Bez tego jedyną drogą wydania
+// było podmienianie sensmos-esp32s3.bin, czyli chwilowe wystawienie eksperymentu CAŁEJ
+// flocie S3 — BE nie ma bina per node, wysyła całą mapę targetów i to node wybiera
+// swój. Z osobnym kluczem płytka z SX1262 nigdy nie weźmie bina floty ani odwrotnie,
+// nawet w jednym rollout.
+//
+// UWAGA: LORA_ENABLED samo w sobie NIE wystarcza do wyboru targetu — S3 i zwykly ESP32
+// (LX6, np. T-Beam) to rozne architektury, wiec kazda rodzina chipu z radiem ma WLASNY
+// target OTA ("esp32s3-lora", "esp32-lora", ...). Test na LORA_ENABLED musi wiec byc
+// W SRODKU kazdej galezi chipu, nigdy PRZED nia — wczesniej test szedl przed CONFIG_IDF_TARGET_*,
+// wiec KAZDY chip skompilowany z LORA_ENABLED=1 zglaszalby sie jako "esp32s3-lora"
+// niezaleznie od faktycznej rodziny (naprawione przy dodaniu wariantu ESP32/T-Beam).
+#if CONFIG_IDF_TARGET_ESP32
+  #if LORA_ENABLED
+    #define OTA_CHIP "esp32-lora"
+  #else
+    #define OTA_CHIP "esp32"
+  #endif
 #elif CONFIG_IDF_TARGET_ESP32S3
   // Build z octal-PSRAM (PSRAM=opi, wariant N16R8) MUSI brać własny bin — generic-s3
   // (PSRAM=disabled) na N16R8 = martwe WiFi RX (KNOWN-ISSUES #2), a po OTA nie ma
@@ -33,6 +40,11 @@
   // przy ich OTA targetować indywidualnie binem n16r8!
   #ifdef CONFIG_SPIRAM_MODE_OCT
     #define OTA_CHIP "esp32s3-n16r8"
+  #elif LORA_ENABLED
+    // JEDEN target na wszystkie plytki S3 z radiem — piny wykrywa sonda przy starcie
+    // (lora_config.h), wiec ten sam bin chodzi na XIAO, Heltecu i reszcie tablicy S3.
+    // Osobny od floty, bo flota nie ma czego robic z RadioLib w binie.
+    #define OTA_CHIP "esp32s3-lora"
   #else
     #define OTA_CHIP "esp32s3"
   #endif
