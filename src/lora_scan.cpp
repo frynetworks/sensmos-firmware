@@ -593,6 +593,10 @@ static void region_load() {
     LOGW("lora", "zapisany region \"%s\" nieznany — zostaje %s", r.c_str(), REGIONS[s_region].name);
 }
 
+// Przestraja plan kanalow po zmianie regionu. Definicja nizej, przy lora_link_set —
+// rusza ten sam stan s_link.
+static void region_apply_to_plan();
+
 bool lora_region_set(const char* name) {
     if (!name || !name[0]) return false;
     for (int i = 0; i < N_REGIONS; i++) {
@@ -600,6 +604,11 @@ bool lora_region_set(const char* name) {
         if (i != s_region) {
             s_region = i;
             memset(s_duty, 0, sizeof(s_duty));     // inne podpasma = inne liczniki
+            // Z regionem musi jechac takze PLAN KANALOW, nie tylko liczniki. Bez tego node
+            // nadawal SMOSB i beacony na nosnej poprzedniego regionu, ksiegujac airtime w
+            // podpasmie nowego — bledne dwukrotnie: emisja poza pasmem, zapisana na budzet,
+            // ktory jej nie obejmuje.
+            region_apply_to_plan();
             s_cur_ch = -1;                          // wymus przestrojenie przy najblizszym ticku
         }
         Preferences p;
@@ -1041,6 +1050,67 @@ static void link_tick() {
     if (s_rx_n >= LORA_RX_BATCH_MAX / 2 || (sec_in_min == 0 && s_rx_n)) link_flush_rx();
 }
 
+// ── Plan kanalow a region ────────────────────────────────────────────────────
+// Plan i region wchodza roznymi drzwiami: plan z BE (lora_cfg) albo z domyslki trybu
+// awaryjnego, region z set_region/NVS. Moga sie wiec rozjechac, a rozjazd nie jest
+// kosmetyczny — oznacza nadawanie na nosnej jednego regionu z airtime ksiegowanym w
+// podpasmie drugiego.
+//
+// POLITYKA (wybrana zamiast "odrzuc zmiane regionu z plan_conflict"): zmiana regionu
+// ZAWSZE sie udaje, a plan NIELEGALNY jest podmieniany, nie zachowywany. Odrzucenie
+// zostawiloby node'a na tej samej nosnej poza pasmem, ktorej juz uzywal — bronilibysmy
+// intencji backendu kosztem tego, co naprawde ma znaczenie. Plan z BE, ktorego wszystkie
+// kanaly mieszcza sie w podpasmach nowego regionu, zostaje NIETKNIETY: backend moze miec
+// lepszy plan wielokanalowy niz nasza jedna domyslka.
+static bool s_plan_from_be    = false;   // biezacy plan przyszedl z lora_cfg, nie z domyslki
+static bool s_installing_dflt = false;   // znacznik re-wejscia dla instalacji domyslki
+
+static void region_default_ch(LoraLinkCh* out) {
+    memset(out, 0, sizeof(*out));
+    out->freq = REGIONS[s_region].smos_freq;
+    out->bw   = LORA_BG_BW;
+    out->sf   = LORA_BG_SF;
+    out->cr   = LORA_BG_CR;
+    out->sync = LORA_BG_SYNC;
+    out->mode = 0;
+}
+
+// true, gdy KAZDY kanal biezacego planu lezy w ktoryms podpasmie regionu.
+static bool plan_is_legal() {
+    for (uint8_t i = 0; i < s_link.n_ch; i++) {
+        const float f = s_link.ch[i].freq;
+        bool inside = false;
+        for (int b = 0; b < 2; b++)
+            if (f >= band_cfg(b)->lo && f <= band_cfg(b)->hi) { inside = true; break; }
+        if (!inside) return false;
+    }
+    return true;
+}
+
+static void install_region_default_plan() {
+    LoraLinkCh ch;
+    region_default_ch(&ch);
+    s_installing_dflt = true;
+    lora_link_set(s_link_be_on, s_link.beacon, s_link.slot, s_link.beacon_s,
+                  s_link.min_per_ch, &ch, 1,
+                  s_link.has_seed ? s_link.seed : nullptr);
+    s_installing_dflt = false;
+    s_link.on = s_link_be_on || s_fb_on;     // fallback nie moze zgasnac przez przestrojenie
+}
+
+static void region_apply_to_plan() {
+    if (!s_link.n_ch) return;                // planu jeszcze nie ma — domyslka zrobi swoje
+    if (!s_plan_from_be) { install_region_default_plan(); return; }
+    if (plan_is_legal()) {
+        LOGI("lora", "zmiana regionu: plan z BE miesci sie w %s — zostaje", REGIONS[s_region].name);
+        return;
+    }
+    LOGW("lora", "zmiana regionu: plan z BE (%.4f MHz) jest POZA %s — podmieniony na "
+                 "domyslke regionu %.4f MHz", s_link.ch[0].freq, REGIONS[s_region].name,
+         REGIONS[s_region].smos_freq);
+    install_region_default_plan();
+}
+
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
                    uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n,
                    const uint8_t* seed) {
@@ -1051,6 +1121,23 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
     if (chans && n) {
         s_link.n_ch = n > LORA_LINK_MAX_CH ? LORA_LINK_MAX_CH : n;
         for (uint8_t i = 0; i < s_link.n_ch; i++) s_link.ch[i] = chans[i];
+        if (!s_installing_dflt) {
+            s_plan_from_be = true;
+            // Walidacja TAKZE tutaj, nie tylko w set_region: BE dosyla lora_cfg po kazdym
+            // identify, wiec nieaktualny plan EU po cichu cofalby zmiane regionu przy
+            // najblizszej ramce.
+            if (!plan_is_legal()) {
+                LOGW("lora", "plan z lora_cfg (%.4f MHz) jest POZA regionem %s — podmieniony "
+                             "na domyslke regionu %.4f MHz", s_link.ch[0].freq,
+                     REGIONS[s_region].name, REGIONS[s_region].smos_freq);
+                LoraLinkCh d;
+                region_default_ch(&d);
+                s_link.ch[0] = d;
+                s_link.n_ch  = 1;
+            }
+        } else {
+            s_plan_from_be = false;
+        }
     }
     // Seed świadomie BEZ NVS: plan pasma i tak przychodzi po każdym identify, więc po
     // resecie node czeka na tę samą ramkę. Gdy seeda w niej nie ma, kasujemy poprzedni —
@@ -1120,17 +1207,18 @@ void lora_fallback_tick() {
 
     s_fb_on = true;
     if (!s_link.n_ch) {                             // brak planu z BE — wez domyslny regionu
-        const LoraRegion& g = REGIONS[s_region];
-        LoraLinkCh ch = {};
-        ch.freq = g.smos_freq; ch.bw = LORA_BG_BW; ch.sf = LORA_BG_SF;
-        ch.cr = LORA_BG_CR;    ch.sync = LORA_BG_SYNC; ch.mode = 0;
-        s_link.ch[0] = ch;
-        s_link.n_ch  = 1;
-        s_link.slot  = 0;
+        s_link.slot   = 0;
         s_link.beacon = true;
         if (!s_link.min_per_ch) s_link.min_per_ch = LORA_LINK_MIN_PER_CH;
+        install_region_default_plan();              // ta sama sciezka co przy zmianie regionu
         LOGI("lora", "fallback: brak planu z BE — kanal domyslny %s %.4f MHz SF%u",
-             g.name, ch.freq, ch.sf);
+             REGIONS[s_region].name, s_link.ch[0].freq, s_link.ch[0].sf);
+    } else if (!plan_is_legal()) {
+        // Plan z BE moze pochodzic z czasow innego regionu. Wejscie w tryb awaryjny to
+        // moment, w ktorym zaczynamy NADAWAC z tego planu — nie wolno tego zrobic poza pasmem.
+        LOGW("lora", "fallback: plan z BE (%.4f MHz) jest POZA regionem %s — domyslka regionu",
+             s_link.ch[0].freq, REGIONS[s_region].name);
+        install_region_default_plan();
     }
     s_link.on = true;
     s_cur_ch  = -1;
@@ -1193,6 +1281,22 @@ static bool enqueue(const LReq& r) {
 // Zwraca false, gdy pod 0x34 nikt nie odpowiada. To jest jednoczesnie test "czy to w ogole
 // T-Beam": plytka bez AXP192 nie zostanie tknieta ani jednym zapisem, a sonda SPI z tego
 // wiersza w ogole sie nie odpali.
+static bool axp192_read_u8(uint8_t reg, uint8_t* out) {
+    Wire.beginTransmission(AXP192_I2C_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(AXP192_I2C_ADDR, (uint8_t)1) != 1) return false;
+    *out = Wire.read();
+    return true;
+}
+
+static bool axp192_write_u8(uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(AXP192_I2C_ADDR);
+    Wire.write(reg);
+    Wire.write(val);
+    return Wire.endTransmission() == 0;
+}
+
 static bool axp192_power_on_radio() {
     Wire.begin(AXP192_SDA, AXP192_SCL);
     Wire.beginTransmission(AXP192_I2C_ADDR);
@@ -1200,25 +1304,40 @@ static bool axp192_power_on_radio() {
         LOGD("lora", "  brak AXP192 pod 0x%02X — pomijam wiersz z PMU", AXP192_I2C_ADDR);
         return false;
     }
-    // LDO2 i LDO3 na 3.3 V (n = 15 w obu nibblach).
-    Wire.beginTransmission(AXP192_I2C_ADDR);
-    Wire.write(AXP192_REG_LDO23_V);
-    Wire.write(AXP192_LDO23_3V3);
-    Wire.endTransmission();
-    // Czytaj-zmodyfikuj-zapisz: rejestr 0x12 trzyma takze DC-DC, ktorych NIE wolno ruszyc
-    // (DC-DC1/3 zasilaja m.in. rdzen i peryferia — nadpisanie calego bajtu gasi plytke).
-    Wire.beginTransmission(AXP192_I2C_ADDR);
-    Wire.write(AXP192_REG_DCDC_EN);
-    Wire.endTransmission(false);
+
+    // ODCZYT PRZED JAKIMKOLWIEK ZAPISEM. Rejestr 0x12 to nie tylko LDO:
+    //   bit0 DC-DC1 (na T-Beam v1.1 szyna 3.3 V CALEJ plytki — rdzen ESP32)
+    //   bit1 DC-DC3 | bit2 LDO2 (radio) | bit3 LDO3 (GPS) | bit4 DC-DC2 | bit6 EXTEN
+    // Zapis calego bajtu wyliczonego z NIEUDANEGO odczytu wystawilby 0x0C i zgasil DC-DC1,
+    // czyli ESP32 odcialby zasilanie sam sobie w trakcie sondowania pinoutow. Nieudany
+    // odczyt = jedna ponowna proba, a potem WYJSCIE bez zapisu; plytka bez sprawnego PMU
+    // ma zostac nietknieta dokladnie tak jak plytka bez AXP192 w ogole.
     uint8_t en = 0;
-    if (Wire.requestFrom(AXP192_I2C_ADDR, (uint8_t)1) == 1) en = Wire.read();
-    en |= (1 << 2) | (1 << 3);                       // LDO2 (radio) + LDO3 (GPS)
-    Wire.beginTransmission(AXP192_I2C_ADDR);
-    Wire.write(AXP192_REG_DCDC_EN);
-    Wire.write(en);
-    Wire.endTransmission();
+    if (!axp192_read_u8(AXP192_REG_DCDC_EN, &en)) {
+        delay(5);
+        if (!axp192_read_u8(AXP192_REG_DCDC_EN, &en)) {
+            LOGW("lora", "  AXP192: odczyt rejestru 0x%02X nieudany (2 proby) — pomijam wiersz "
+                 "z PMU BEZ zapisu; zapis 'na slepo' zgasilby DC-DC1 (rdzen ESP32)",
+                 AXP192_REG_DCDC_EN);
+            return false;
+        }
+    }
+
+    // LDO2 i LDO3 na 3.3 V (n = 15 w obu nibblach). Samo napiecie, bez zalaczania.
+    if (!axp192_write_u8(AXP192_REG_LDO23_V, AXP192_LDO23_3V3)) {
+        LOGW("lora", "  AXP192: zapis napiecia LDO2/3 nieudany — pomijam wiersz z PMU");
+        return false;
+    }
+    // Czytaj-zmodyfikuj-zapisz: zachowujemy wszystkie pozostale bity dokladnie takie,
+    // jakie byly, i tylko DOKLADAMY LDO2 + LDO3.
+    const uint8_t want = (uint8_t)(en | (1 << 2) | (1 << 3));
+    if (!axp192_write_u8(AXP192_REG_DCDC_EN, want)) {
+        LOGW("lora", "  AXP192: zapis rejestru 0x%02X nieudany — pomijam wiersz z PMU",
+             AXP192_REG_DCDC_EN);
+        return false;
+    }
     delay(50);                                       // szyna 3.3 V musi sie ustalic
-    LOGI("lora", "  AXP192: LDO2+LDO3 = 3.3 V (radio zasilone)");
+    LOGI("lora", "  AXP192: LDO2+LDO3 = 3.3 V (radio zasilone; 0x%02X -> 0x%02X)", en, want);
     return true;
 }
 

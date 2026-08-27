@@ -605,11 +605,24 @@ static void region_load() {
     duty_apply_region();
 }
 
+// Re-derives the SENSMOS channel plan after a region change. Defined further down,
+// next to lora_link_set, because it manipulates the same s_link state.
+static void region_apply_to_plan();
+
 bool lora_region_set(const char* name) {
     if (!name || !name[0]) return false;
     for (int i = 0; i < N_REGIONS; i++) {
         if (strcasecmp(name, REGIONS[i].name) != 0) continue;
-        if (i != s_region) { s_region = i; duty_apply_region(); s_cur_ch = -1; }
+        if (i != s_region) {
+            s_region = i;
+            duty_apply_region();
+            // The channel PLAN has to move with the region, not just the duty counters.
+            // Without this the node kept transmitting SMOSB/beacons on the previous
+            // region's carrier while debiting the new region's sub-band — wrong twice:
+            // an out-of-band emission, booked against a budget that did not cover it.
+            region_apply_to_plan();
+            s_cur_ch = -1;               // force a retune on the next link tick
+        }
         Preferences p;
         if (p.begin("sensmos_mesh", false)) { p.putString("region", REGIONS[i].name); p.end(); }
         const LoraRegion& g = REGIONS[i];
@@ -1041,6 +1054,72 @@ static void link_tick() {
     if (s_rx_n >= LORA_RX_BATCH_MAX / 2 || (sec_in_min == 0 && s_rx_n)) link_flush_rx();
 }
 
+// ── Channel plan vs region ───────────────────────────────────────────────────
+// The plan and the region are set through different doors: the plan arrives from the
+// backend (lora_cfg) or from the boot default, the region from set_region/NVS. They can
+// therefore disagree, and a disagreement is not cosmetic — it means transmitting on one
+// region's carrier while the airtime is booked against another region's sub-band.
+//
+// POLICY (chosen over "refuse the region change with plan_conflict"): a region change
+// ALWAYS succeeds, and an ILLEGAL plan is replaced rather than preserved. Refusing would
+// leave the node sitting on the out-of-band carrier it was already using, so the refusal
+// would protect the backend's intent at the cost of the thing that actually matters. A
+// backend plan whose channels all fall inside the new region's bands is kept untouched —
+// the backend may well have a better multi-channel plan than our single default.
+static bool s_plan_from_be     = false;   // current plan came from lora_cfg, not our default
+static bool s_installing_dflt  = false;   // re-entrancy marker for the internal install
+
+static void region_default_ch(LoraLinkCh* out) {
+    memset(out, 0, sizeof(*out));
+    out->freq = REGIONS[s_region].smos_freq;
+    out->bw   = LORA_BG_BW;
+    out->sf   = LORA_BG_SF;
+    out->cr   = LORA_BG_CR;
+    out->sync = LORA_BG_SYNC;
+    out->mode = 0;
+}
+
+// True when every channel of the current plan lies inside one of the region's sub-bands.
+static bool plan_is_legal() {
+    for (uint8_t i = 0; i < s_link.n_ch; i++) {
+        const float f = s_link.ch[i].freq;
+        bool inside = false;
+        for (int b = 0; b < 2; b++) {
+            const LoraBand& band = REGIONS[s_region].band[b];
+            if (f >= band.lo && f <= band.hi) { inside = true; break; }
+        }
+        if (!inside) return false;
+    }
+    return true;
+}
+
+static void install_region_default_plan() {
+    LoraLinkCh ch;
+    region_default_ch(&ch);
+    s_installing_dflt = true;
+    lora_link_set(s_link.on, s_link.beacon, s_link.slot, s_link.beacon_s,
+                  s_link.min_per_ch, &ch, 1,
+                  s_link.has_seed ? s_link.seed : nullptr);
+    s_installing_dflt = false;
+}
+
+static void region_apply_to_plan() {
+    if (!s_link.n_ch) return;                      // no plan yet — boot default handles it
+    if (!s_plan_from_be) {                         // our own default: just re-derive it
+        install_region_default_plan();
+        return;
+    }
+    if (plan_is_legal()) {
+        LOGI("lora", "region change: backend plan is within %s — keeping it",
+             REGIONS[s_region].name);
+        return;
+    }
+    LOGW("lora", "region change: backend plan (%.4f MHz) is OUTSIDE %s — replaced with the "
+                 "region default %.4f MHz", s_link.ch[0].freq, REGIONS[s_region].name,
+         REGIONS[s_region].smos_freq);
+    install_region_default_plan();
+}
+
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
                    uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n,
                    const uint8_t* seed) {
@@ -1051,6 +1130,23 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
     if (chans && n) {
         s_link.n_ch = n > LORA_LINK_MAX_CH ? LORA_LINK_MAX_CH : n;
         for (uint8_t i = 0; i < s_link.n_ch; i++) s_link.ch[i] = chans[i];
+        if (!s_installing_dflt) {
+            s_plan_from_be = true;
+            // Validate HERE too, not only on set_region: the backend re-sends lora_cfg
+            // after every identify, so a stale EU plan would otherwise silently undo a
+            // region switch on the very next frame.
+            if (!plan_is_legal()) {
+                LOGW("lora", "lora_cfg plan (%.4f MHz) is OUTSIDE region %s — replaced with "
+                             "the region default %.4f MHz", s_link.ch[0].freq,
+                     REGIONS[s_region].name, REGIONS[s_region].smos_freq);
+                LoraLinkCh d;
+                region_default_ch(&d);
+                s_link.ch[0] = d;
+                s_link.n_ch  = 1;
+            }
+        } else {
+            s_plan_from_be = false;
+        }
     }
     // Seed świadomie BEZ NVS: plan pasma i tak przychodzi po każdym identify, więc po
     // resecie node czeka na tę samą ramkę. Gdy seeda w niej nie ma, kasujemy poprzedni —
@@ -1206,15 +1302,19 @@ void lora_scan_init() {
 
 #if LORA_LINK_DEFAULT
     // LoRa-only port: LINK mode is the transport, so it starts by itself with a
-    // single-channel EU868 default plan. Upstream waits for the backend's lora_cfg
-    // over WS — that frame cannot arrive on a node with no WiFi. A later lora_cfg
-    // via serial/BLE provisioning overrides this plan. TX slot derives from the
-    // device id so co-located default nodes spread across beacon slots.
-    LoraLinkCh ch = {};
-    ch.freq = LORA_BG_FREQ; ch.bw = LORA_BG_BW; ch.sf = LORA_BG_SF;
-    ch.cr = LORA_BG_CR; ch.sync = LORA_BG_SYNC; ch.mode = 0;
+    // single-channel default plan taken from the ACTIVE REGION (region_load ran at the
+    // top of this function). It used to hardcode LORA_BG_FREQ, which meant a node with
+    // US915 stored in NVS still came up transmitting on 868.1 MHz. Upstream waits for the
+    // backend's lora_cfg over WS — that frame cannot arrive on a node with no WiFi. A
+    // later lora_cfg via serial/BLE provisioning overrides this plan (and is validated
+    // against the region). TX slot derives from the device id so co-located default nodes
+    // spread across beacon slots.
+    LoraLinkCh ch;
+    region_default_ch(&ch);
     uint8_t slot = (uint8_t)((g_device_id[0] % 16) % 5);
+    s_installing_dflt = true;
     lora_link_set(true, true, slot, 0, LORA_LINK_MIN_PER_CH, &ch, 1, nullptr);
+    s_installing_dflt = false;
 #endif
 }
 
