@@ -1281,6 +1281,22 @@ static bool enqueue(const LReq& r) {
 // Zwraca false, gdy pod 0x34 nikt nie odpowiada. To jest jednoczesnie test "czy to w ogole
 // T-Beam": plytka bez AXP192 nie zostanie tknieta ani jednym zapisem, a sonda SPI z tego
 // wiersza w ogole sie nie odpali.
+static bool axp192_read_u8(uint8_t reg, uint8_t* out) {
+    Wire.beginTransmission(AXP192_I2C_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(AXP192_I2C_ADDR, (uint8_t)1) != 1) return false;
+    *out = Wire.read();
+    return true;
+}
+
+static bool axp192_write_u8(uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(AXP192_I2C_ADDR);
+    Wire.write(reg);
+    Wire.write(val);
+    return Wire.endTransmission() == 0;
+}
+
 static bool axp192_power_on_radio() {
     Wire.begin(AXP192_SDA, AXP192_SCL);
     Wire.beginTransmission(AXP192_I2C_ADDR);
@@ -1288,25 +1304,40 @@ static bool axp192_power_on_radio() {
         LOGD("lora", "  brak AXP192 pod 0x%02X — pomijam wiersz z PMU", AXP192_I2C_ADDR);
         return false;
     }
-    // LDO2 i LDO3 na 3.3 V (n = 15 w obu nibblach).
-    Wire.beginTransmission(AXP192_I2C_ADDR);
-    Wire.write(AXP192_REG_LDO23_V);
-    Wire.write(AXP192_LDO23_3V3);
-    Wire.endTransmission();
-    // Czytaj-zmodyfikuj-zapisz: rejestr 0x12 trzyma takze DC-DC, ktorych NIE wolno ruszyc
-    // (DC-DC1/3 zasilaja m.in. rdzen i peryferia — nadpisanie calego bajtu gasi plytke).
-    Wire.beginTransmission(AXP192_I2C_ADDR);
-    Wire.write(AXP192_REG_DCDC_EN);
-    Wire.endTransmission(false);
+
+    // ODCZYT PRZED JAKIMKOLWIEK ZAPISEM. Rejestr 0x12 to nie tylko LDO:
+    //   bit0 DC-DC1 (na T-Beam v1.1 szyna 3.3 V CALEJ plytki — rdzen ESP32)
+    //   bit1 DC-DC3 | bit2 LDO2 (radio) | bit3 LDO3 (GPS) | bit4 DC-DC2 | bit6 EXTEN
+    // Zapis calego bajtu wyliczonego z NIEUDANEGO odczytu wystawilby 0x0C i zgasil DC-DC1,
+    // czyli ESP32 odcialby zasilanie sam sobie w trakcie sondowania pinoutow. Nieudany
+    // odczyt = jedna ponowna proba, a potem WYJSCIE bez zapisu; plytka bez sprawnego PMU
+    // ma zostac nietknieta dokladnie tak jak plytka bez AXP192 w ogole.
     uint8_t en = 0;
-    if (Wire.requestFrom(AXP192_I2C_ADDR, (uint8_t)1) == 1) en = Wire.read();
-    en |= (1 << 2) | (1 << 3);                       // LDO2 (radio) + LDO3 (GPS)
-    Wire.beginTransmission(AXP192_I2C_ADDR);
-    Wire.write(AXP192_REG_DCDC_EN);
-    Wire.write(en);
-    Wire.endTransmission();
+    if (!axp192_read_u8(AXP192_REG_DCDC_EN, &en)) {
+        delay(5);
+        if (!axp192_read_u8(AXP192_REG_DCDC_EN, &en)) {
+            LOGW("lora", "  AXP192: odczyt rejestru 0x%02X nieudany (2 proby) — pomijam wiersz "
+                 "z PMU BEZ zapisu; zapis 'na slepo' zgasilby DC-DC1 (rdzen ESP32)",
+                 AXP192_REG_DCDC_EN);
+            return false;
+        }
+    }
+
+    // LDO2 i LDO3 na 3.3 V (n = 15 w obu nibblach). Samo napiecie, bez zalaczania.
+    if (!axp192_write_u8(AXP192_REG_LDO23_V, AXP192_LDO23_3V3)) {
+        LOGW("lora", "  AXP192: zapis napiecia LDO2/3 nieudany — pomijam wiersz z PMU");
+        return false;
+    }
+    // Czytaj-zmodyfikuj-zapisz: zachowujemy wszystkie pozostale bity dokladnie takie,
+    // jakie byly, i tylko DOKLADAMY LDO2 + LDO3.
+    const uint8_t want = (uint8_t)(en | (1 << 2) | (1 << 3));
+    if (!axp192_write_u8(AXP192_REG_DCDC_EN, want)) {
+        LOGW("lora", "  AXP192: zapis rejestru 0x%02X nieudany — pomijam wiersz z PMU",
+             AXP192_REG_DCDC_EN);
+        return false;
+    }
     delay(50);                                       // szyna 3.3 V musi sie ustalic
-    LOGI("lora", "  AXP192: LDO2+LDO3 = 3.3 V (radio zasilone)");
+    LOGI("lora", "  AXP192: LDO2+LDO3 = 3.3 V (radio zasilone; 0x%02X -> 0x%02X)", en, want);
     return true;
 }
 
