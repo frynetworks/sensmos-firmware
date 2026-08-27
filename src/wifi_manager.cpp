@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <esp_wifi.h>     // esp_wifi_set_country — kanały 12-13 (EU)
 #include "data_sender.h"  // FW_VERSION
+#include "lora_scan.h"    // lora_fallback_active — cialo pliku pod #if LORA_ENABLED
 
 bool g_wifi_connected = false;
 char g_wifi_ssid[64]  = {0};
@@ -292,6 +293,20 @@ void wifi_maintain() {
         LOGW("wifi", "reconnect() (down %lus)", down / 1000);
     }
     if (down >= WIFI_DOWN_REBOOT_MS) {      // twardy fallback
+#if LORA_ENABLED
+        // Node z aktywnym transportem LoRa NIE JEST martwy — nadaje SMOSB i Meshtastica,
+        // tylko nie przez WiFi. Restart urwalby mu jedyny dzialajacy transport i wrocil
+        // do tej samej sytuacji cztery minuty pozniej, w kolko. Reconnect() wyzej leci
+        // dalej co 20 s, wiec powrot routera nadal jest wychwytywany.
+        if (lora_fallback_active()) {
+            static unsigned long s_lastNote = 0;
+            if (now - s_lastNote >= 60000) {
+                s_lastNote = now;
+                LOGW("wifi", "WiFi down %lus — reboot WSTRZYMANY, transport na LoRa", down / 1000);
+            }
+            return;
+        }
+#endif
         LOGE("wifi", "WiFi down %lus — ESP.restart()", down / 1000);
         delay(200);
         ESP.restart();

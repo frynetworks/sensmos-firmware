@@ -60,4 +60,13 @@ void lora_link_status_json(String& out);
 // absent, batch too large, or a previous batch still in flight.
 bool lora_uplink_enqueue(const char* json, size_t len);
 bool lora_uplink_pending();
+
+// ── Region (frequency plan) ───────────────────────────────────
+// One row of LORA_REGIONS drives the SENSMOS channel, the Meshtastic channel, both power
+// caps and the duty/dwell model of both sub-bands. Default (no NVS entry) = EU868, whose
+// row holds the previous literals, so the stock build is unchanged.
+const LoraRegion* lora_region();
+const char*       lora_region_name();
+// false = unknown name; configuration is left UNTOUCHED (answer "bad_region").
+bool              lora_region_set(const char* name);
 #endif

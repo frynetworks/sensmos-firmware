@@ -9,6 +9,8 @@
 #include "identity.h"
 #include "mesh_tx.h"  // dual-protocol: Meshtastic TX shares this radio and duty budget
 #include <SHA256.h>   // nRF port: HMAC-SHA256 via rweather/Crypto (mbedtls absent)
+#include <Preferences.h>  // region persistence — "sensmos_mesh" namespace, shared with mesh_tx
+#include <string.h>       // strcasecmp for region lookup
 
 static const LoraPinout PINOUTS[] = LORA_PINOUTS;
 static const int        N_PINOUTS  = sizeof(PINOUTS) / sizeof(PINOUTS[0]);
@@ -533,30 +535,91 @@ static int      s_cur_ch   = -1;         // indeks kanału, na którym stoi radi
 // counter starved both protocols while g4 still had ~90% of its allowance unused.
 // Each transmitter resolves its band FROM THE FREQUENCY IT IS ABOUT TO USE, so a
 // channel-plan change moves the accounting with it.
+// The two bands are no longer EU868 literals: they are columns of the ACTIVE REGION row,
+// so switching region moves the edges, the budgets and the log names together. On EU868
+// the row still reads g1 868.0-868.6 @36 s/h and g4 869.4-869.65 @360 s/h, so counters
+// and log strings are unchanged and gate_duty_bands.py keeps passing untouched.
 struct DutyBand {
     uint32_t used_ms;
     uint32_t limit_ms;
     uint32_t hour;                       // epoch/3600 of the window used_ms belongs to
     const char* name;
 };
-static DutyBand s_duty_g1 = { 0, DUTY_G1_LIMIT_MS, 0, "g1" };
-static DutyBand s_duty_g4 = { 0, DUTY_G4_LIMIT_MS, 0, "g4" };
+static const LoraRegion REGIONS[] = LORA_REGIONS;
+static const int        N_REGIONS = sizeof(REGIONS) / sizeof(REGIONS[0]);
+static int              s_region  = LORA_REGION_DEFAULT;
+
+static DutyBand s_duty[2] = {
+    { 0, DUTY_G1_LIMIT_MS,  0, "g1" },
+    { 0, DUTY_G4_LIMIT_MS,  0, "g4" },
+};
+
+// Re-points the counters at the current region's bands. Called on load and on change;
+// the used_ms/hour pair is reset because a different band is a different allowance.
+static void duty_apply_region() {
+    for (int i = 0; i < 2; i++) {
+        s_duty[i].limit_ms = REGIONS[s_region].band[i].limit_ms;
+        s_duty[i].name     = REGIONS[s_region].band[i].name;
+        s_duty[i].used_ms  = 0;
+        s_duty[i].hour     = 0;
+    }
+}
 
 static DutyBand* duty_for_freq(float mhz) {
-    if (mhz >= 869.4f && mhz <= 869.65f) return &s_duty_g4;
-    if (mhz >= 868.0f && mhz <= 868.6f)  return &s_duty_g1;
-    return &s_duty_g1;                   // unknown channel: charge the strictest band
+    for (int i = 0; i < 2; i++) {
+        const LoraBand& b = REGIONS[s_region].band[i];
+        if (mhz >= b.lo && mhz <= b.hi) return &s_duty[i];
+    }
+    return &s_duty[0];                   // unknown channel: charge the strictest band
 }
 
 // Rolls the band's hour window, then answers whether `est` ms still fits. Windows
 // roll independently — a band that has not transmitted keeps its own stale hour
 // number until it does, which is harmless because the reset happens before the check.
+// The dwell test (FCC/AS regions) refuses one over-long transmission; on EU868 dwell_ms
+// is zero for both bands, so that branch never fires in the default plan.
 static bool duty_allows(DutyBand* b, uint32_t now, uint32_t est) {
     uint32_t h = now / 3600;
     if (h != b->hour) { b->hour = h; b->used_ms = 0; }
+    const uint32_t dwell = (b == &s_duty[1]) ? REGIONS[s_region].band[1].dwell_ms
+                                             : REGIONS[s_region].band[0].dwell_ms;
+    if (dwell && est > dwell) return false;
     return b->used_ms + est <= b->limit_ms;
 }
 static void duty_debit(DutyBand* b, uint32_t air) { b->used_ms += air; }
+
+// ── Region ───────────────────────────────────────────────────────────────────
+const LoraRegion* lora_region()      { return &REGIONS[s_region]; }
+const char*       lora_region_name() { return REGIONS[s_region].name; }
+
+static void region_load() {
+    Preferences p;
+    if (!p.begin("sensmos_mesh", true)) return;
+    String r = p.getString("region", "");
+    p.end();
+    if (!r.length()) { duty_apply_region(); return; }   // no entry = EU868, as before
+    for (int i = 0; i < N_REGIONS; i++) {
+        if (strcasecmp(r.c_str(), REGIONS[i].name) == 0) { s_region = i; duty_apply_region(); return; }
+    }
+    LOGW("lora", "stored region \"%s\" unknown — keeping %s", r.c_str(), REGIONS[s_region].name);
+    duty_apply_region();
+}
+
+bool lora_region_set(const char* name) {
+    if (!name || !name[0]) return false;
+    for (int i = 0; i < N_REGIONS; i++) {
+        if (strcasecmp(name, REGIONS[i].name) != 0) continue;
+        if (i != s_region) { s_region = i; duty_apply_region(); s_cur_ch = -1; }
+        Preferences p;
+        if (p.begin("sensmos_mesh", false)) { p.putString("region", REGIONS[i].name); p.end(); }
+        const LoraRegion& g = REGIONS[i];
+        LOGI("lora", "region -> %s (SENSMOS %.4f MHz %d dBm %s, mesh %.3f MHz %d dBm %s)",
+             g.name, g.smos_freq, (int)g.smos_power, g.band[0].name,
+             g.mesh_freq, (int)g.mesh_power, g.band[1].name);
+        return true;
+    }
+    return false;                        // unknown region: nothing is touched
+}
 
 static uint32_t s_tx_seq   = 0;
 static uint32_t s_rx_total = 0, s_rx_dropped = 0;
@@ -716,7 +779,7 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     if (s_link.has_seed) beacon_code(code, now / 60);
     int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu %d %d %d%s%s",
                      LORA_BEACON_PREFIX, g_device_id, (unsigned long)s_tx_seq,
-                     (int)s_last.bg_noise, (int)s_last.bg_peak, LORA_LINK_TX_POWER,
+                     (int)s_last.bg_noise, (int)s_last.bg_peak, (int)REGIONS[s_region].smos_power,
                      code[0] ? " " : "", code);
     if (n < 0) return 0;
     if (n > (int)sizeof(pl) - 1) n = (int)sizeof(pl) - 1;   // snprintf zwraca dlugosc SPRZED obciecia
@@ -731,7 +794,7 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
         return 0;
     }
     uint32_t t0 = millis();
-    s_radio.setOutputPower(LORA_LINK_TX_POWER);
+    s_radio.setOutputPower(REGIONS[s_region].smos_power);
     int st = s_radio.transmit((uint8_t*)pl, n + 1);
     uint32_t air = millis() - t0;
     // KRYTYCZNE: transmit() też generuje przerwanie DIO1 (TxDone), a nasz ISR nie odróżnia
@@ -821,7 +884,7 @@ static void uplink_tx_next(const LoraLinkCh& c) {
         return;
     }
     uint32_t t0 = millis();
-    s_radio.setOutputPower(LORA_LINK_TX_POWER);
+    s_radio.setOutputPower(REGIONS[s_region].smos_power);
     int st = s_radio.transmit((uint8_t*)pl, n + 1);
     uint32_t air = millis() - t0;
     s_irq = false;                       // TxDone shares DIO1 with RxDone — drop it
@@ -948,7 +1011,7 @@ static void link_tick() {
         last_mesh_sec = sec_in_min;
         // Meshtastic transmits in g4, which has its OWN 10% allowance — SMOS traffic
         // in g1 neither spends it nor is spent by it.
-        DutyBand* mband = duty_for_freq(MESH_FREQ);
+        DutyBand* mband = duty_for_freq(REGIONS[s_region].mesh_freq);
         duty_allows(mband, now, 0);             // roll g4's hour window before reading it
         uint32_t air = mesh_tx_next(s_radio, mband->used_ms, mband->limit_ms,
                                     g_pin->tcxo, g_pin->rxen, g_pin->dio2_rf != 0);
@@ -1006,21 +1069,23 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
 bool lora_link_on() { return s_link.on; }
 
 void lora_link_status_json(String& out) {
-    static char b[288];                      // static (.bss), not stack — embedded in get_info's 4KB loop-task chain
+    static char b[320];                      // static (.bss), not stack — embedded in get_info's 4KB loop-task chain
     uint32_t now = ws_epoch_now();
-    // duty_ms_h stays as the g1 figure so anything reading the old field keeps seeing
-    // the SENSMOS band it always meant; g1_ms/g4_ms carry the per-band split. Keys are
-    // kept short on purpose — this object is embedded in the serial get_info response,
-    // which has a fixed-size buffer.
+    // duty_ms_h stays as the SENSMOS-band figure so anything reading the old field keeps
+    // seeing the band it always meant; g1_ms/g4_ms carry the per-band split. The KEY NAMES
+    // stay g1/g4 even outside EU868 — the backend parses them positionally as "SENSMOS
+    // band" and "mesh band"; the band's real name travels in `region`. Keys are kept short
+    // on purpose — this object is embedded in the serial get_info response, which has a
+    // fixed-size buffer (bumped in serial_cmd.cpp to fit `region`).
     snprintf(b, sizeof(b),
         "{\"on\":%s,\"beacon\":%s,\"slot\":%u,\"ch\":%d,\"n_ch\":%u,\"tx_seq\":%lu,"
-        "\"rx_total\":%lu,\"rx_dropped\":%lu,\"duty_ms_h\":%lu,"
+        "\"rx_total\":%lu,\"rx_dropped\":%lu,\"region\":\"%s\",\"duty_ms_h\":%lu,"
         "\"g1_ms\":%lu,\"g1_max\":%lu,\"g4_ms\":%lu,\"g4_max\":%lu,\"epoch\":%lu}",
         s_link.on ? "true" : "false", s_link.beacon ? "true" : "false", s_link.slot,
         s_cur_ch, s_link.n_ch, (unsigned long)s_tx_seq, (unsigned long)s_rx_total,
-        (unsigned long)s_rx_dropped, (unsigned long)s_duty_g1.used_ms,
-        (unsigned long)s_duty_g1.used_ms, (unsigned long)s_duty_g1.limit_ms,
-        (unsigned long)s_duty_g4.used_ms, (unsigned long)s_duty_g4.limit_ms,
+        (unsigned long)s_rx_dropped, REGIONS[s_region].name, (unsigned long)s_duty[0].used_ms,
+        (unsigned long)s_duty[0].used_ms, (unsigned long)s_duty[0].limit_ms,
+        (unsigned long)s_duty[1].used_ms, (unsigned long)s_duty[1].limit_ms,
         (unsigned long)now);
     out = b;
 }
@@ -1093,6 +1158,15 @@ static bool try_pinout(const LoraPinout& p) {
 }
 
 void lora_scan_init() {
+    // Region BEFORE the probe: every later transmission resolves its band and power from
+    // the active row, so loading it late would book the first hour's airtime against the
+    // previous region's sub-bands.
+    region_load();
+    LOGI("lora", "region: %s (SENSMOS %.4f MHz %d dBm %s, mesh %.3f MHz %d dBm %s)",
+         REGIONS[s_region].name, REGIONS[s_region].smos_freq, (int)REGIONS[s_region].smos_power,
+         REGIONS[s_region].band[0].name, REGIONS[s_region].mesh_freq,
+         (int)REGIONS[s_region].mesh_power, REGIONS[s_region].band[1].name);
+
     // Sondowanie: jeden bin obsługuje każdą płytkę z tablicy. LORA_PIN_FORCE pomija próby
     // i wymusza konkretny wpis — furtka na wypadek płytki, która źle znosi cudze piny.
     bool found = false;

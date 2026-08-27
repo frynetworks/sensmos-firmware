@@ -20,6 +20,7 @@
 #include "src/net_worker.h"
 #include "src/tunnel.h"
 #include "src/lora_scan.h"
+#include "src/mesh_tx.h"
 #include "src/pairing.h"
 #include "src/log.h"
 #include "src/config.h"
@@ -167,7 +168,8 @@ void setup() {
             pairing_init();      // klucze parowania z NVS — uprawnienie do tunelu (zastąpiły flagę remote_ok)
             tunnel_init();       // RemoteTerminal — RAM (~27KB) dopiero przy tun_open
 #if LORA_ENABLED
-            lora_scan_init();    // własny task na core 0; no-op gdy płytka nie ma SX1262
+            mesh_tx_init();      // config dwustosu z NVS — PRZED lora_scan_init (task go czyta)
+            lora_scan_init();    // własny task na core 0; no-op gdy płytka nie ma radia
 #endif
             LOGI("boot", "ready — heap %uk free, blk %uk",
                  ESP.getFreeHeap() / 1024, ESP.getMaxAllocHeap() / 1024);
@@ -219,7 +221,8 @@ void loop() {
     }
     if (g_ble_active) ble_tick();
 #if LORA_ENABLED
-    lora_pump();         // skrzynka taska radiowego — wysyłka MUSI iść z loop, nie z core 0
+    lora_pump();           // skrzynka taska radiowego — wysyłka MUSI iść z loop, nie z core 0
+    lora_fallback_tick();  // brak WiFi dłużej niż próg -> transport przechodzi na LoRa
 #endif
     ext_auth_tick();     // przystawki — timeout ceremonii i sprzątanie wydanego tokenu
     ota_tick();

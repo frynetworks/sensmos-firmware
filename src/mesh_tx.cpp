@@ -3,9 +3,8 @@
 
 #include "mesh_proto.h"
 #include "identity.h"
-#include "lora_scan.h"        // lora_region() — RF params follow the active region row
 #include "log.h"
-#include "esp_random.h"
+#include <esp_random.h>
 #include <Preferences.h>
 #include <string.h>
 
@@ -55,7 +54,7 @@ void mesh_tx_init() {
         apply_psk();
     }
     // Packet ids must not repeat under one key: the CTR nonce is built from them.
-    // Seed from the TRNG so a reboot cannot replay the previous run's ids.
+    // Seed from the hardware RNG so a reboot cannot replay the previous run's ids.
     esp_fill_random((uint8_t*)&s_packet_id, sizeof(s_packet_id));
     if (!s_packet_id) s_packet_id = 1;
 
@@ -129,7 +128,7 @@ bool mesh_uplink_enqueue(const char* json, size_t len) {
     return true;
 }
 
-// Airtime per the SX126x datasheet formula — same helper as the SMOS path, kept
+// Airtime per the Semtech datasheet formula — same helper as the SMOS path, kept
 // local so mesh TX can be budget-checked before the radio is retuned.
 static uint32_t mesh_airtime_ms(uint8_t sf, float bw_khz, uint8_t cr, uint16_t len) {
     if (sf < 6)  sf = 6;
@@ -144,13 +143,13 @@ static uint32_t mesh_airtime_ms(uint8_t sf, float bw_khz, uint8_t cr, uint16_t l
     return (uint32_t)((MESH_PREAMBLE + 4.25f + n) * ts) + 1;
 }
 
-uint32_t mesh_tx_next(SX1262& radio, uint32_t duty_ms, uint32_t duty_budget,
+uint32_t mesh_tx_next(LoraRadio& radio, uint32_t duty_ms, uint32_t duty_budget,
                       float tcxo, int8_t rxen_pin, bool dio2_rf) {
     if (!s_pending || !s_enabled) return 0;
 
     // RF parameters follow the ACTIVE REGION, not the EU868 literals. The modem preset
     // (SF/BW/CR/sync/preamble) is region-independent — LongFast is LongFast everywhere;
-    // only the carrier, the power ceiling and the sub-band's name move.
+    // only the carrier and the power ceiling move.
     const LoraRegion* rg    = lora_region();
     const float       freq  = rg->mesh_freq;
     const int8_t      power = rg->mesh_power;
@@ -179,8 +178,8 @@ uint32_t mesh_tx_next(SX1262& radio, uint32_t duty_ms, uint32_t duty_budget,
 
     const uint32_t est = mesh_airtime_ms(MESH_SF, MESH_BW, MESH_CR, (uint16_t)flen);
     if (duty_ms + est > duty_budget) {
-        // The caller passes g4's own counter and limit — mesh waits only when the
-        // Meshtastic sub-band itself is spent, never because SMOS used up g1.
+        // The caller passes the Meshtastic band's own counter and limit — mesh waits
+        // only when that sub-band is spent, never because SMOS used up its own.
         // Log once per duty window — the counter falling is the caller starting a
         // new hour, which is the only moment a fresh warning carries information.
         static uint32_t last_duty = 0;

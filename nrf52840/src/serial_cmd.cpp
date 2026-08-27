@@ -97,7 +97,9 @@ static void cmd_get_info(JsonDocument& doc, const char* cmd) {
     // loop-task stack (shared with SoftDevice) and the get_info chain (resp[720] + lora[224]
     // + lora_link_status_json's b[288] + newlib vsnprintf) overran it → hard fault. The loop
     // task is single-threaded, so a function-static buffer is safe (not reentrant).
-    static char lora[224]; String ls;
+    // 288, was 224: lora_link_status_json gained the `region` field and the old buffer
+    // truncated the object mid-JSON. Still .bss, still not the stack — see above.
+    static char lora[288]; String ls;
     lora[0] = 0;
     if (lora_available()) {
         lora_link_status_json(ls);
@@ -200,6 +202,17 @@ static void cmd_get_mesh_cfg(JsonDocument& doc, const char* cmd) {
     Serial.printf("[serial] %s\n", resp);
 }
 
+// set_region — frequency plan (EU868 by default). An unknown name changes NOTHING.
+// {"cmd":"set_region","region":"US915"}
+static void cmd_set_region(JsonDocument& doc, const char* cmd) {
+    const char* rg = doc["region"];
+    if (!rg || !lora_region_set(rg)) { serial_respond("error", cmd, "bad_region"); return; }
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+        "{\"status\":\"ok\",\"cmd\":\"set_region\",\"region\":\"%s\"}", lora_region_name());
+    Serial.printf("[serial] %s\n", resp);
+}
+
 static void cmd_help(JsonDocument& doc, const char* cmd) {
     Serial.println("\n[serial] JSON commands (same protocol as BLE):");
     Serial.println("  {\"cmd\":\"get_info\"} | {\"cmd\":\"get_token\"} | {\"cmd\":\"send_now\"}");
@@ -209,6 +222,7 @@ static void cmd_help(JsonDocument& doc, const char* cmd) {
     Serial.println("  {\"cmd\":\"lora_cfg\",\"channels\":[{\"freq\":868.1,\"sf\":7}]}");
     Serial.println("  {\"cmd\":\"lora\",\"do\":\"status|sweep|camp|listen|cad|hunt|bg\"}");
     Serial.println("  {\"cmd\":\"get_mesh_cfg\"} | {\"cmd\":\"set_mesh_cfg\",\"enabled\":true,\"channel\":\"LongFast\",\"psk\":\"AQ==\"}");
+    Serial.println("  {\"cmd\":\"set_region\",\"region\":\"EU868|US915|AU915|AS923-1|IN865|KR920|RU864\"}");
     Serial.println("  {\"cmd\":\"factory_reset\"} | {\"cmd\":\"done\"} | {\"cmd\":\"help\"}\n");
 }
 
@@ -261,6 +275,7 @@ static const CmdEntry CMD_TABLE[] = {
     { "lora",            cmd_lora },
     { "set_mesh_cfg",    cmd_set_mesh_cfg },
     { "get_mesh_cfg",    cmd_get_mesh_cfg },
+    { "set_region",      cmd_set_region },
 #endif
 };
 
