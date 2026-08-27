@@ -7,6 +7,7 @@
 #include "wifi_manager.h"
 #include "http_server.h"
 #include "lora_scan.h"
+#include "mesh_tx.h"      // caly plik jest pod #if LORA_ENABLED — w buildzie flotowym pusty
 #include <ArduinoJson.h>
 #include <Preferences.h>
 
@@ -90,6 +91,29 @@ static void cmd_unregister(JsonDocument& doc, const char* cmd) {
 static void cmd_get_info(JsonDocument& doc, const char* cmd) {
     char pubkey_hex[131];
     identity_get_pubkey_hex(pubkey_hex, sizeof(pubkey_hex));
+#if LORA_ENABLED
+    // Wariant radiowy dokleja region i stan trybu awaryjnego. Swiadomie ZDUBLOWANY zamiast
+    // sklejany warunkowo: build flotowy ma kompilowac dokladnie ta sama instrukcje co przed
+    // zmiana, co dowodzi sie porownaniem obrazu .bin, nie czytaniem diffa.
+    char lora[64];
+    snprintf(lora, sizeof(lora), ",\"region\":\"%s\",\"lora_fallback\":%s",
+             lora_region_name(), lora_fallback_active() ? "true" : "false");
+    char resp[680];
+    snprintf(resp, sizeof(resp),
+        "{\"status\":\"ok\",\"cmd\":\"get_info\","
+        "\"device_id\":\"%s\","
+        "\"eth_address\":\"%s\","
+        "\"owner_address\":\"%s\","
+        "\"ip\":\"%s\","
+        "\"backend\":\"%s\","
+        "\"pubkey\":\"%.32s...\","
+        "\"registered\":%s%s,"
+        "\"firmware\":\"" FW_VERSION "\"}",
+        g_device_id, g_eth_address, g_owner_address,
+        g_local_ip,
+        g_backend_url, pubkey_hex,
+        strlen(g_owner_address) > 0 ? "true" : "false", lora);
+#else
     char resp[600];
     snprintf(resp, sizeof(resp),
         "{\"status\":\"ok\",\"cmd\":\"get_info\","
@@ -105,6 +129,7 @@ static void cmd_get_info(JsonDocument& doc, const char* cmd) {
         g_local_ip,
         g_backend_url, pubkey_hex,
         strlen(g_owner_address) > 0 ? "true" : "false");
+#endif
     Serial.printf("[serial] %s\n", resp);
 }
 
@@ -143,6 +168,11 @@ static void cmd_help(JsonDocument& doc, const char* cmd) {
     Serial.println("  {\"cmd\":\"get_info\"}");
     Serial.println("  {\"cmd\":\"get_token\"}");
     Serial.println("  {\"cmd\":\"factory_reset\"}  <- serial only");
+#if LORA_ENABLED
+    Serial.println("  {\"cmd\":\"lora\",\"do\":\"status|sweep|camp|listen|cad|hunt|bg\"}");
+    Serial.println("  {\"cmd\":\"get_mesh_cfg\"} | {\"cmd\":\"set_mesh_cfg\",\"enabled\":true,\"channel\":\"LongFast\",\"psk\":\"AQ==\"}");
+    Serial.println("  {\"cmd\":\"set_region\",\"region\":\"EU868|US915|AU915|AS923-1|IN865|KR920|RU864\"}");
+#endif
     Serial.println("  {\"cmd\":\"help\"}            <- serial only\n");
 }
 
@@ -196,6 +226,38 @@ static void cmd_lora(JsonDocument& doc, const char* cmd) {
     if (ok) serial_respond("ok", cmd);
     else    serial_respond("error", cmd, lora_available() ? "busy" : "no_radio");
 }
+
+// set_mesh_cfg — ustawienia dwustosu Meshtastica.
+// {"cmd":"set_mesh_cfg","enabled":true,"channel":"LongFast","psk":"AQ==","portnum":1}
+// psk: base64 klucz 16/32 B albo forma indeksowa jednobajtowa ("AQ==" = klucz domyslny).
+static void cmd_set_mesh_cfg(JsonDocument& doc, const char* cmd) {
+    const bool     en = doc["enabled"]  | true;
+    const char*    ch = doc["channel"];
+    const char*    pk = doc["psk"];
+    const uint32_t pn = doc["portnum"]  | 0UL;
+    if (!mesh_tx_configure(en, ch, pk, pn)) { serial_respond("error", cmd, "bad_psk"); return; }
+    serial_respond("ok", cmd);
+}
+
+static void cmd_get_mesh_cfg(JsonDocument& doc, const char* cmd) {
+    String st;
+    mesh_tx_status_json(st);
+    char resp[400];
+    snprintf(resp, sizeof(resp),
+        "{\"status\":\"ok\",\"cmd\":\"get_mesh_cfg\",\"mesh\":%s}", st.c_str());
+    Serial.printf("[serial] %s\n", resp);
+}
+
+// set_region — plan czestotliwosci (EU868 domyslnie). Nieznana nazwa NIE zmienia niczego.
+// {"cmd":"set_region","region":"US915"}
+static void cmd_set_region(JsonDocument& doc, const char* cmd) {
+    const char* rg = doc["region"];
+    if (!rg || !lora_region_set(rg)) { serial_respond("error", cmd, "bad_region"); return; }
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+        "{\"status\":\"ok\",\"cmd\":\"set_region\",\"region\":\"%s\"}", lora_region_name());
+    Serial.printf("[serial] %s\n", resp);
+}
 #endif
 
 // ── Tablica dispatchu ─────────────────────────────────────────
@@ -218,6 +280,9 @@ static const CmdEntry CMD_TABLE[] = {
     { "get_push_token",  cmd_get_push_token },
 #if LORA_ENABLED
     { "lora",            cmd_lora },
+    { "set_mesh_cfg",    cmd_set_mesh_cfg },
+    { "get_mesh_cfg",    cmd_get_mesh_cfg },
+    { "set_region",      cmd_set_region },
 #endif
 };
 

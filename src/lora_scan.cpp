@@ -3,21 +3,33 @@
 
 #include <RadioLib.h>
 #include <SPI.h>
+#include <Wire.h>
+#include <Preferences.h>
 #include "entity_store.h"
 #include "log.h"
 #include "ws_client.h"
 #include "identity.h"
+#include "wifi_manager.h"
+#include "mesh_proto.h"
+#include "mesh_tx.h"
 #include <mbedtls/md.h>
 
 static const LoraPinout PINOUTS[] = LORA_PINOUTS;
 static const int        N_PINOUTS  = sizeof(PINOUTS) / sizeof(PINOUTS[0]);
 
+static const LoraRegion REGIONS[] = LORA_REGIONS;
+static const int        N_REGIONS = sizeof(REGIONS) / sizeof(REGIONS[0]);
+static int              s_region  = LORA_REGION_DEFAULT;
+
 // Radio wskazuje na pinout, ktory FAKTYCZNIE odpowiedzial przy starcie. Wskaznik nigdy nie
 // jest null (startuje na pierwszym kandydacie), bo s_radio jest uzywane w 38 miejscach i nie
 // chce, zeby jedno wywolanie przed inicjalizacja konczylo sie crashem zamiast "brak radia".
+// Wiersz [0] jest i pozostaje SX1262, wiec zapasowy uchwyt buduje sie bez sterty — sonda
+// dopiero podmienia go na kandydata, ktory odpowiedzial (patrz try_pinout).
 static Module           s_mod0(PINOUTS[0].nss, PINOUTS[0].dio1, PINOUTS[0].rst, PINOUTS[0].busy);
 static SX1262           s_radio0(&s_mod0);
-static SX1262*          g_radio = &s_radio0;
+static LoraRadio        s_wrap0(&s_radio0);
+static LoraRadio*       g_radio = &s_wrap0;
 static const LoraPinout* g_pin  = &PINOUTS[0];
 #define s_radio (*g_radio)
 static bool         s_ok    = false;
@@ -522,9 +534,85 @@ static struct {
     LoraLinkCh ch[LORA_LINK_MAX_CH];
 } s_link = {};
 
+// Tryb awaryjny (LoRa zamiast WiFi) wlacza link SAM. s_link_be_on pamieta, o co prosil
+// backend, zeby powrot WiFi przywrocil dokladnie tamten stan. Oba pola czyta task radiowy
+// z rdzenia 0, a pisze loop() z rdzenia 1 — stad volatile, tak jak przy s_link.on.
+static volatile bool s_fb_on      = false;
+static volatile bool s_link_be_on = LORA_LINK_DEFAULT;
+
 static int      s_cur_ch   = -1;         // indeks kanału, na którym stoi radio
-static uint32_t s_duty_ms  = 0;          // airtime w bieżącym oknie godzinowym
-static uint32_t s_duty_h   = 0;          // numer okna (epoch/3600)
+
+// ── Duty cycle, ODDZIELNIE dla kazdego podpasma regionu ──────────────────────
+// Jeden licznik na node bylby zly w OBIE strony: dlawilby ruch, ktory na swoim pasmie
+// jest wciaz legalny, a jednoczesnie ukrylby przekroczenie, gdyby zsumowac dwa pasma.
+// W EU868 to konkretnie g1 (868.0-868.6, 1% = 36 s/h, beacon + SMOSB) i g4
+// (869.4-869.65, 10% = 360 s/h, Meshtastic) — doliczanie SF11 Meshtastica do licznika
+// SMOS zaglodzilo oba protokoly przy ~36 s/h, mimo ze g4 mialo jeszcze ~90% zapasu.
+// Kazdy nadajnik rozstrzyga pasmo Z CZESTOTLIWOSCI, ktorej wlasnie uzywa, wiec zmiana
+// planu kanalow (albo regionu) przenosi ksiegowanie razem z nia.
+struct DutyBand {
+    uint32_t used_ms;
+    uint32_t hour;                       // epoch/3600 okna, do ktorego nalezy used_ms
+};
+static DutyBand s_duty[2] = {};
+
+static const LoraBand* band_cfg(int i) { return &REGIONS[s_region].band[i]; }
+
+static int band_for_freq(float mhz) {
+    for (int i = 0; i < 2; i++)
+        if (mhz >= band_cfg(i)->lo && mhz <= band_cfg(i)->hi) return i;
+    return 0;                            // nieznany kanal: obciaz pasmo najostrzejsze
+}
+
+// Przewija okno godzinowe pasma, potem odpowiada, czy `est` ms jeszcze sie miesci.
+// Okna przewijaja sie NIEZALEZNIE — pasmo, ktore nie nadawalo, trzyma swoj stary numer
+// godziny az do pierwszej transmisji, co jest nieszkodliwe, bo reset dzieje sie przed
+// sprawdzeniem. dwell_ms (regiony FCC/AS) odrzuca POJEDYNCZA zbyt dluga transmisje;
+// w EU868 jest zerowy, wiec ta galaz nie zmienia niczego w domyslnym planie.
+static bool duty_allows(int bi, uint32_t now, uint32_t est) {
+    const LoraBand* b = band_cfg(bi);
+    uint32_t h = now / 3600;
+    if (h != s_duty[bi].hour) { s_duty[bi].hour = h; s_duty[bi].used_ms = 0; }
+    if (b->dwell_ms && est > b->dwell_ms) return false;
+    return s_duty[bi].used_ms + est <= b->limit_ms;
+}
+static void duty_debit(int bi, uint32_t air) { s_duty[bi].used_ms += air; }
+
+// ── Region ───────────────────────────────────────────────────────────────────
+const LoraRegion* lora_region()      { return &REGIONS[s_region]; }
+const char*       lora_region_name() { return REGIONS[s_region].name; }
+
+static void region_load() {
+    Preferences p;
+    if (!p.begin("sensmos_mesh", true)) return;
+    String r = p.getString("region", "");
+    p.end();
+    if (!r.length()) return;                       // brak wpisu = EU868, jak dotad
+    for (int i = 0; i < N_REGIONS; i++)
+        if (!strcasecmp(r.c_str(), REGIONS[i].name)) { s_region = i; return; }
+    LOGW("lora", "zapisany region \"%s\" nieznany — zostaje %s", r.c_str(), REGIONS[s_region].name);
+}
+
+bool lora_region_set(const char* name) {
+    if (!name || !name[0]) return false;
+    for (int i = 0; i < N_REGIONS; i++) {
+        if (strcasecmp(name, REGIONS[i].name) != 0) continue;
+        if (i != s_region) {
+            s_region = i;
+            memset(s_duty, 0, sizeof(s_duty));     // inne podpasma = inne liczniki
+            s_cur_ch = -1;                          // wymus przestrojenie przy najblizszym ticku
+        }
+        Preferences p;
+        if (p.begin("sensmos_mesh", false)) { p.putString("region", REGIONS[i].name); p.end(); }
+        const LoraRegion& g = REGIONS[i];
+        LOGI("lora", "region -> %s (SENSMOS %.4f MHz %d dBm %s, mesh %.3f MHz %d dBm %s)",
+             g.name, g.smos_freq, (int)g.smos_power, g.band[0].name,
+             g.mesh_freq, (int)g.mesh_power, g.band[1].name);
+        return true;
+    }
+    return false;                                   // nieznany region: nic nie ruszamy
+}
+
 static uint32_t s_tx_seq   = 0;
 static uint32_t s_rx_total = 0, s_rx_dropped = 0;
 static uint32_t s_rx_min   = 0, s_rx_in_min = 0;   // licznik cap/min
@@ -669,8 +757,8 @@ static void beacon_code(char out[9], uint32_t minute) {
 // Nadanie beaconu. Zwraca airtime w ms (0 = nie nadano).
 static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     uint32_t now = ws_epoch_now();
-    uint32_t h = now / 3600;
-    if (h != s_duty_h) { s_duty_h = h; s_duty_ms = 0; }
+    const int   bi  = band_for_freq(c.freq);
+    const int8_t txp = REGIONS[s_region].smos_power;
     // Ramka niesie to, czego ODBIORNIK nie ma jak zmierzyc: moc nadawania (bez niej nie
     // policzysz tlumienia trasy, bo tlumienie = txp - rssi) oraz podloge i szczyt szumu
     // u nadawcy (bez nich nie odroznisz "slabo go slysze bo daleko" od "slabo bo u niego
@@ -683,7 +771,7 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     if (s_link.has_seed) beacon_code(code, now / 60);
     int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu %d %d %d%s%s",
                      LORA_BEACON_PREFIX, g_device_id, (unsigned long)s_tx_seq,
-                     (int)s_last.bg_noise, (int)s_last.bg_peak, LORA_LINK_TX_POWER,
+                     (int)s_last.bg_noise, (int)s_last.bg_peak, (int)txp,
                      code[0] ? " " : "", code);
     if (n < 0) return 0;
     if (n > (int)sizeof(pl) - 1) n = (int)sizeof(pl) - 1;   // snprintf zwraca dlugosc SPRZED obciecia
@@ -692,12 +780,14 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     // Airtime z RZECZYWISTEJ dlugosci ramki. Stale 44 B przestaly byc prawda, gdy doszedl
     // kod (do 47 B), a zanizony szacunek okrada licznik duty cycle z tego, po co istnieje.
     uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, (uint8_t)(n + 1));
-    if (s_duty_ms + est > LORA_LINK_DUTY_MS_H) {
-        LOGW("lora", "beacon skipped — duty cycle budget spent (%lums/h)", (unsigned long)s_duty_ms);
+    if (!duty_allows(bi, now, est)) {
+        LOGW("lora", "beacon skipped — %s duty budget spent (%lu/%lums per h)",
+             band_cfg(bi)->name, (unsigned long)s_duty[bi].used_ms,
+             (unsigned long)band_cfg(bi)->limit_ms);
         return 0;
     }
     uint32_t t0 = millis();
-    s_radio.setOutputPower(LORA_LINK_TX_POWER);
+    s_radio.setOutputPower(txp);
     int st = s_radio.transmit((uint8_t*)pl, n + 1);
     uint32_t air = millis() - t0;
     // KRYTYCZNE: transmit() też generuje przerwanie DIO1 (TxDone), a nasz ISR nie odróżnia
@@ -706,10 +796,107 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     s_irq = false;
     s_radio.startReceive();                                  // NATYCHMIAST z powrotem w nasłuch
     if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "beacon TX failed (%d)", st); return 0; }
-    s_duty_ms += air; s_tx_seq++;
-    LOGI("lora", "beacon #%lu sent @%.3f SF%u (%lums air, duty %lums/h)",
-         (unsigned long)s_tx_seq - 1, c.freq, c.sf, (unsigned long)air, (unsigned long)s_duty_ms);
+    duty_debit(bi, air); s_tx_seq++;
+    LOGI("lora", "beacon #%lu sent @%.3f SF%u (%lums air, duty %lu/%lums/h %s)",
+         (unsigned long)s_tx_seq - 1, c.freq, c.sf, (unsigned long)air,
+         (unsigned long)s_duty[bi].used_ms, (unsigned long)band_cfg(bi)->limit_ms,
+         band_cfg(bi)->name);
     return air;
+}
+
+// ── Batch uplink (SMOSB) ─────────────────────────────────────────────────────
+// Podpisane paczki danych wychodza z noda jako pociete ramki LoRa na kanale LINK:
+//   [0xE1]["SMOSB "][id8][' '][seq hex4][' '][idx]['/'][cnt][' '][base64 z 72 B]
+// Jedna ramka na sekunde, poza slotem beaconu i oknami guard, kazda obciazana tym samym
+// licznikiem podpasma co beacon. Po drugiej stronie nie ma protokolu bramki — odbior jest
+// sprawa wdrozenia; zadaniem noda jest wystawic uwierzytelnione dane w eter w ramach budzetu.
+static char          s_up_buf[LORA_UPLINK_BUF];
+static size_t        s_up_len = 0;
+static uint16_t      s_up_seq = 0;
+static uint8_t       s_up_frag = 0, s_up_nfrag = 0;
+static volatile bool s_up_pending = false;
+#define LORA_UPLINK_RAW_CHUNK ((LORA_UPLINK_CHUNK / 4) * 3)   // 96 znakow b64 = 72 bajty
+
+static const char UP_B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static size_t up_b64(const uint8_t* in, size_t len, char* out) {
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < len) v |= in[i + 2];
+        out[o++] = UP_B64[(v >> 18) & 63];
+        out[o++] = UP_B64[(v >> 12) & 63];
+        out[o++] = (i + 1 < len) ? UP_B64[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < len) ? UP_B64[v & 63] : '=';
+    }
+    out[o] = 0;
+    return o;
+}
+
+bool lora_uplink_enqueue(const char* json, size_t len) {
+    if (!s_ok || !len || len >= LORA_UPLINK_BUF) return false;
+    if (s_up_pending) return false;                 // jedna paczka w locie naraz
+    memcpy(s_up_buf, json, len);
+    s_up_len   = len;
+    s_up_frag  = 0;
+    s_up_nfrag = (uint8_t)((len + LORA_UPLINK_RAW_CHUNK - 1) / LORA_UPLINK_RAW_CHUNK);
+    s_up_pending = true;
+    LOGI("lora", "uplink queued: %uB -> %u frames (seq %u)",
+         (unsigned)len, s_up_nfrag, s_up_seq);
+    return true;
+}
+
+bool lora_uplink_pending() { return s_up_pending; }
+
+// Nadanie JEDNEJ zaleglej ramki uplinku. Ta sama dyscyplina duty cycle co beacon.
+static void uplink_tx_next(const LoraLinkCh& c) {
+    if (!s_up_pending) return;
+    uint32_t now = ws_epoch_now();
+    const int    bi  = band_for_freq(c.freq);
+    const int8_t txp = REGIONS[s_region].smos_power;
+
+    char pl[LORA_RX_HEX_MAX + 4];
+    size_t off = (size_t)s_up_frag * LORA_UPLINK_RAW_CHUNK;
+    size_t raw = s_up_len - off;
+    if (raw > LORA_UPLINK_RAW_CHUNK) raw = LORA_UPLINK_RAW_CHUNK;
+    char b64[LORA_UPLINK_CHUNK + 8];
+    up_b64((const uint8_t*)s_up_buf + off, raw, b64);
+    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %04x %u/%u %s",
+                     LORA_UPLINK_PREFIX, g_device_id, (unsigned)s_up_seq,
+                     (unsigned)(s_up_frag + 1), (unsigned)s_up_nfrag, b64);
+    if (n < 0) { s_up_pending = false; return; }
+    if (n > (int)sizeof(pl) - 1) n = (int)sizeof(pl) - 1;
+    pl[0] = (char)LORA_UPLINK_MAGIC;
+
+    uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, (uint8_t)(n + 1));
+    if (!duty_allows(bi, now, est)) {
+        // Budzet wyczerpany — paczka czeka na kolejne okno; ramki sa idempotentne.
+        static uint32_t warned_h = 0;
+        if (warned_h != s_duty[bi].hour) { warned_h = s_duty[bi].hour;
+            LOGW("lora", "uplink paused — %s duty budget spent (%lu/%lums per h)",
+                 band_cfg(bi)->name, (unsigned long)s_duty[bi].used_ms,
+                 (unsigned long)band_cfg(bi)->limit_ms); }
+        return;
+    }
+    uint32_t t0 = millis();
+    s_radio.setOutputPower(txp);
+    int st = s_radio.transmit((uint8_t*)pl, n + 1);
+    uint32_t air = millis() - t0;
+    s_irq = false;                       // TxDone dzieli DIO1 z RxDone — zignoruj
+    s_radio.startReceive();
+    if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "uplink TX failed (%d)", st); return; }
+    duty_debit(bi, air);
+    LOGI("lora", "uplink frame %u/%u sent @%.3f (%luB, %lums air, duty %lu/%lums/h %s)",
+         (unsigned)(s_up_frag + 1), (unsigned)s_up_nfrag, c.freq,
+         (unsigned long)(n + 1), (unsigned long)air,
+         (unsigned long)s_duty[bi].used_ms, (unsigned long)band_cfg(bi)->limit_ms,
+         band_cfg(bi)->name);
+    if (++s_up_frag >= s_up_nfrag) {
+        s_up_pending = false;
+        LOGI("lora", "uplink batch seq %u complete (%u frames)", (unsigned)s_up_seq,
+             (unsigned)s_up_nfrag);
+        s_up_seq++;
+    }
 }
 
 // Jeden przebieg pętli link (~200 ms). Wszystko sterowane zegarem UTC — bez stanu między iteracjami.
@@ -797,6 +984,45 @@ static void link_tick() {
         link_tx_beacon(c);
     }
 
+    // Batch uplink: jedna ramka na sekunde, po slocie beaconu i z dala od okna guard
+    // wokol rotacji kanalu.
+    static uint32_t last_up_sec = 61;
+    bool smos_tx_this_sec = false;
+    if (s_up_pending && sec_in_min != last_up_sec &&
+        sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
+        last_up_sec = sec_in_min;
+        uplink_tx_next(c);
+        smos_tx_this_sec = true;
+    }
+
+    // Uplink Meshtastica (dwustos): ta sama paczka, w ramkowaniu Meshtastica, na kanale
+    // Meshtastica. Podzial czasu na JEDNYM radiu — SMOS ma pierwszenstwo, a mesh bierze
+    // wylacznie sekunde, w ktorej SMOS nie nadawal, wiec zaden protokol nie wywlaszcza
+    // drugiego w polowie pakietu. Przestrojenie jest drogie (~0,7 s SF11 plus dwa begin()),
+    // wiec dzieje sie najwyzej raz na sekunde i ZAWSZE oddaje radio na kanal SENSMOS,
+    // zanim ponizej otworzy sie okno RX.
+    static uint32_t last_mesh_sec = 61;
+    if (!smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
+        sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
+        last_mesh_sec = sec_in_min;
+        // Meshtastic nadaje we WLASNYM podpasmie z wlasnym budzetem — ruch SMOS ani go
+        // nie wydaje, ani nie jest przez niego wydawany.
+        const int mbi = band_for_freq(REGIONS[s_region].mesh_freq);
+        duty_allows(mbi, now, 0);           // przewin okno godzinowe przed odczytem
+        // dio2_rf=false: ten port NIGDY nie wolal setDio2AsRfSwitch (patrz after_begin) —
+        // przelacznik anteny opisuje wylacznie rxen. Przekazujemy to samo, co robi
+        // after_begin, zeby przestrojenie mesh nie wprowadzalo nowej konfiguracji RF.
+        uint32_t air = mesh_tx_next(s_radio, s_duty[mbi].used_ms, band_cfg(mbi)->limit_ms,
+                                    g_pin->tcxo, g_pin->rxen, false);
+        duty_debit(mbi, air);
+        // Powrot na parametry SENSMOS bez wzgledu na to, jak skonczylo sie nadanie mesh:
+        // nieudana transmisja, ktora zostawilaby radio na kanale Meshtastica, po cichu
+        // zabilaby odbior SMOS.
+        if (!cfg_ch(c)) { LOGW("lora", "restore after mesh TX failed"); delay(200); return; }
+        s_irq = false;
+        s_radio.startReceive();
+    }
+
     // Ciągły RX — 200 ms pollingu IRQ.
     uint32_t t0 = millis();
     while (millis() - t0 < 200) {
@@ -833,7 +1059,11 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
     if (seed) memcpy(s_link.seed, seed, sizeof(s_link.seed));
     else      memset(s_link.seed, 0, sizeof(s_link.seed));
     s_link.has_seed = (seed != nullptr);
-    s_link.on = on;
+    // Zapamietujemy INTENCJE BE osobno od stanu faktycznego: tryb awaryjny wlacza link
+    // sam, a przy powrocie WiFi musi oddac dokladnie to, o co prosil backend, a nie
+    // zostawic wlaczony link, ktorego nikt nie zamawial.
+    s_link_be_on = on;
+    s_link.on = on || s_fb_on;
     s_cur_ch = -1;                                            // wymuś retune przy najbliższym tick
     LOGI("lora", "link %s: beacon=%d slot=%u every=%us, %u channels, %u min/ch, seed=%d",
          on ? "ON" : "off", beacon ? 1 : 0, slot, beacon_s, s_link.n_ch, s_link.min_per_ch,
@@ -843,16 +1073,72 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
 bool lora_link_on() { return s_link.on; }
 
 void lora_link_status_json(String& out) {
-    char b[220];
+    char b[360];
     uint32_t now = ws_epoch_now();
     snprintf(b, sizeof(b),
         "{\"on\":%s,\"beacon\":%s,\"slot\":%u,\"ch\":%d,\"n_ch\":%u,\"tx_seq\":%lu,"
-        "\"rx_total\":%lu,\"rx_dropped\":%lu,\"duty_ms_h\":%lu,\"epoch\":%lu}",
+        "\"rx_total\":%lu,\"rx_dropped\":%lu,\"region\":\"%s\",\"fallback\":%s,"
+        "\"duty\":[{\"band\":\"%s\",\"ms\":%lu,\"limit\":%lu},"
+        "{\"band\":\"%s\",\"ms\":%lu,\"limit\":%lu}],\"epoch\":%lu}",
         s_link.on ? "true" : "false", s_link.beacon ? "true" : "false", s_link.slot,
         s_cur_ch, s_link.n_ch, (unsigned long)s_tx_seq, (unsigned long)s_rx_total,
-        (unsigned long)s_rx_dropped, (unsigned long)s_duty_ms, (unsigned long)now);
+        (unsigned long)s_rx_dropped, REGIONS[s_region].name, s_fb_on ? "true" : "false",
+        band_cfg(0)->name, (unsigned long)s_duty[0].used_ms, (unsigned long)band_cfg(0)->limit_ms,
+        band_cfg(1)->name, (unsigned long)s_duty[1].used_ms, (unsigned long)band_cfg(1)->limit_ms,
+        (unsigned long)now);
     out = b;
 }
+
+// ══ Tryb awaryjny: brak WiFi -> transport LoRa ════════════════
+// SENSMOS po LoRa nie ma potwierdzen, wiec nie da sie sterowac tym trybem "czy dotarlo".
+// Wyzwalaczem jest NIEOBECNOSC WiFi przez LORA_FALLBACK_AFTER_S; po wejsciu nadajemy
+// bezwarunkowo w obie strony (SMOSB + Meshtastic), jak port nRF, ktory nie ma innego
+// transportu w ogole. Wyjscie natychmiast po powrocie linku.
+//
+// Gdy BE nigdy nie przyslal planu kanalow (a offline nie ma jak przyslac), instalujemy
+// plan domyslny z aktywnego regionu — inaczej link_tick nie mialby na czym stanac.
+void lora_fallback_tick() {
+    if (!s_ok) return;
+    static uint32_t s_down_since = 0;
+    const uint32_t now = millis();
+
+    if (g_wifi_connected) {
+        s_down_since = 0;
+        if (s_fb_on) {
+            s_fb_on = false;
+            s_link.on = s_link_be_on;               // oddaj dokladnie to, o co prosil BE
+            s_cur_ch = -1;
+            LOGI("lora", "fallback OFF — WiFi wrocilo, link wraca do stanu z BE (%s)",
+                 s_link_be_on ? "ON" : "off");
+        }
+        return;
+    }
+
+    if (!s_down_since) { s_down_since = now ? now : 1; return; }
+    if (s_fb_on) return;
+    if ((now - s_down_since) / 1000UL < LORA_FALLBACK_AFTER_S) return;
+
+    s_fb_on = true;
+    if (!s_link.n_ch) {                             // brak planu z BE — wez domyslny regionu
+        const LoraRegion& g = REGIONS[s_region];
+        LoraLinkCh ch = {};
+        ch.freq = g.smos_freq; ch.bw = LORA_BG_BW; ch.sf = LORA_BG_SF;
+        ch.cr = LORA_BG_CR;    ch.sync = LORA_BG_SYNC; ch.mode = 0;
+        s_link.ch[0] = ch;
+        s_link.n_ch  = 1;
+        s_link.slot  = 0;
+        s_link.beacon = true;
+        if (!s_link.min_per_ch) s_link.min_per_ch = LORA_LINK_MIN_PER_CH;
+        LOGI("lora", "fallback: brak planu z BE — kanal domyslny %s %.4f MHz SF%u",
+             g.name, ch.freq, ch.sf);
+    }
+    s_link.on = true;
+    s_cur_ch  = -1;
+    LOGW("lora", "fallback ON — WiFi down %lus, transport przechodzi na LoRa (SMOSB + mesh)",
+         (unsigned long)((now - s_down_since) / 1000UL));
+}
+
+bool lora_fallback_active() { return s_fb_on; }
 
 // ── Task ──────────────────────────────────────────────────────
 static void lora_task(void*) {
@@ -899,21 +1185,70 @@ static bool enqueue(const LReq& r) {
 // Próba JEDNEGO pinoutu. Zwraca true, gdy SX1262 odpowiedział — RadioLib daje
 // RADIOLIB_ERR_CHIP_NOT_FOUND, gdy odczyt rejestru nie wraca, więc to pytanie do krzemu,
 // a nie wnioskowanie z czasu. Nic nie nadajemy, sonda jest wyłącznie odczytem.
+// AXP192 (T-Beam v1.1): radio wisi na LDO2 i bez niego SPI odpowiada cisza — sonda
+// uznalaby sprawna plytke za "bez radia". Robimy dokladnie to, co Meshtastic robi przez
+// XPowersLib w src/power.cpp: LDO2 3.3 V (radio) + LDO3 3.3 V (GPS), zalaczone bitami
+// 2 i 3 rejestru 0x12. Bez dokladania biblioteki PMU — to dwa zapisy przez Wire.
+//
+// Zwraca false, gdy pod 0x34 nikt nie odpowiada. To jest jednoczesnie test "czy to w ogole
+// T-Beam": plytka bez AXP192 nie zostanie tknieta ani jednym zapisem, a sonda SPI z tego
+// wiersza w ogole sie nie odpali.
+static bool axp192_power_on_radio() {
+    Wire.begin(AXP192_SDA, AXP192_SCL);
+    Wire.beginTransmission(AXP192_I2C_ADDR);
+    if (Wire.endTransmission() != 0) {
+        LOGD("lora", "  brak AXP192 pod 0x%02X — pomijam wiersz z PMU", AXP192_I2C_ADDR);
+        return false;
+    }
+    // LDO2 i LDO3 na 3.3 V (n = 15 w obu nibblach).
+    Wire.beginTransmission(AXP192_I2C_ADDR);
+    Wire.write(AXP192_REG_LDO23_V);
+    Wire.write(AXP192_LDO23_3V3);
+    Wire.endTransmission();
+    // Czytaj-zmodyfikuj-zapisz: rejestr 0x12 trzyma takze DC-DC, ktorych NIE wolno ruszyc
+    // (DC-DC1/3 zasilaja m.in. rdzen i peryferia — nadpisanie calego bajtu gasi plytke).
+    Wire.beginTransmission(AXP192_I2C_ADDR);
+    Wire.write(AXP192_REG_DCDC_EN);
+    Wire.endTransmission(false);
+    uint8_t en = 0;
+    if (Wire.requestFrom(AXP192_I2C_ADDR, (uint8_t)1) == 1) en = Wire.read();
+    en |= (1 << 2) | (1 << 3);                       // LDO2 (radio) + LDO3 (GPS)
+    Wire.beginTransmission(AXP192_I2C_ADDR);
+    Wire.write(AXP192_REG_DCDC_EN);
+    Wire.write(en);
+    Wire.endTransmission();
+    delay(50);                                       // szyna 3.3 V musi sie ustalic
+    LOGI("lora", "  AXP192: LDO2+LDO3 = 3.3 V (radio zasilone)");
+    return true;
+}
+
 static bool try_pinout(const LoraPinout& p) {
+    if (p.pmu && !axp192_power_on_radio()) return false;
+
     SPI.end();
     SPI.begin(p.sck, p.miso, p.mosi, p.nss);
 
     // Instancje na stercie, bo pinów w Module nie da się zmienić po konstrukcji.
     // Przegrane kandydatury zwalniamy od razu — zostaje tylko zwycięzca.
-    Module* mod = new Module(p.nss, p.dio1, p.rst, p.busy);
-    SX1262* rad = new SX1262(mod);
+    // SX127x nie ma pinu BUSY, a przerwanie oddaje na DIO0 — Module dostaje wiec DIO0
+    // jako zrodlo IRQ i RADIOLIB_NC w miejscu, ktorego ta rodzina nie uzywa.
+    const bool sx76 = (p.chip == LORA_CHIP_SX1276);
+    Module* mod = sx76 ? new Module(p.nss, p.dio0, p.rst, RADIOLIB_NC)
+                       : new Module(p.nss, p.dio1, p.rst, p.busy);
+    // Uchwyt rodziny trzymany osobno: LoraRadio tylko ADOPTUJE wskaznik, wiec skasowanie
+    // samej otoczki zostawiloby obiekt SX na stercie. Przy szesciu nieudanych probach
+    // uzbieraloby sie tego tyle, ze zabraloby pamiec, ktora ten projekt swiadomie trzyma
+    // ciagla dla TLS.
+    SX1262* r62 = sx76 ? nullptr : new SX1262(mod);
+    SX1276* r76 = sx76 ? new SX1276(mod) : nullptr;
+    LoraRadio* rad = sx76 ? new LoraRadio(r76) : new LoraRadio(r62);
     if (p.rxen >= 0) rad->setRfSwitchPins(p.rxen, RADIOLIB_NC);
 
     int st = rad->begin(LORA_BG_FREQ, LORA_BG_BW, LORA_BG_SF, LORA_BG_CR,
                         LORA_BG_SYNC, 10, 8, p.tcxo, false);
     if (st != RADIOLIB_ERR_NONE) {
         LOGD("lora", "  %-14s nie odpowiada (begin = %d)", p.name, st);
-        delete rad; delete mod;
+        delete rad; delete r62; delete r76; delete mod;
         return false;
     }
     g_radio = rad; g_pin = &p;
@@ -921,6 +1256,19 @@ static bool try_pinout(const LoraPinout& p) {
 }
 
 void lora_scan_init() {
+    // Region PRZED sonda: kanal startowy sondy to LORA_BG_FREQ (EU868), ale kazde pozniejsze
+    // nadanie liczy pasmo i moc z aktywnego wiersza — bez tego pierwsza godzina po restarcie
+    // ksiegowalaby airtime w podpasmach poprzedniego regionu.
+    region_load();
+    LOGI("lora", "region: %s (SENSMOS %.4f MHz %d dBm %s, mesh %.3f MHz %d dBm %s)",
+         REGIONS[s_region].name, REGIONS[s_region].smos_freq, (int)REGIONS[s_region].smos_power,
+         REGIONS[s_region].band[0].name, REGIONS[s_region].mesh_freq,
+         (int)REGIONS[s_region].mesh_power, REGIONS[s_region].band[1].name);
+    // Kodowanie Meshtastica sprawdza sie SAMO przy starcie: zla ramka nie objawia sie
+    // bledem, tylko cisza w cudzej sieci, wiec bez tego testu regresja w AES-CTR albo
+    // w protobufie byla wykrywalna dopiero cudzym radiem.
+    mesh_proto_selftest();
+
     // Sondowanie: jeden bin obsługuje każdą płytkę z tablicy. LORA_PIN_FORCE pomija próby
     // i wymusza konkretny wpis — furtka na wypadek płytki, która źle znosi cudze piny.
     bool found = false;
@@ -929,18 +1277,19 @@ void lora_scan_init() {
         LOGI("lora", "pinout wymuszony: %s -> %s", PINOUTS[LORA_PIN_FORCE].name,
              found ? "OK" : "BRAK ODPOWIEDZI");
     } else {
-        LOGI("lora", "szukam SX1262 (%d pinoutow)...", N_PINOUTS);
+        LOGI("lora", "szukam radia (%d pinoutow)...", N_PINOUTS);
         for (int i = 0; i < N_PINOUTS && !found; i++) found = try_pinout(PINOUTS[i]);
     }
 
     if (!found) {
-        // Brak radia to normalny przypadek — ten sam bin chodzi na sprzęcie bez SX1262.
+        // Brak radia to normalny przypadek — ten sam bin chodzi na sprzęcie bez radia.
         // Node ma działać dalej jak zwykle, tylko bez LoRa.
-        LOGW("lora", "nie znaleziono SX1262 na zadnym ze znanych pinoutow - plytka bez radia?");
+        LOGW("lora", "nie znaleziono radia na zadnym ze znanych pinoutow - plytka bez radia?");
         return;
     }
-    LOGI("lora", "SX1262 znaleziony: plytka %s (nss%d dio%d rst%d busy%d, tcxo %.1fV)",
-         g_pin->name, g_pin->nss, g_pin->dio1, g_pin->rst, g_pin->busy, g_pin->tcxo);
+    LOGI("lora", "%s znaleziony: plytka %s (nss%d irq%d rst%d busy%d, tcxo %.1fV)",
+         s_radio.chip_name(), g_pin->name, g_pin->nss,
+         s_radio.is_sx1276() ? g_pin->dio0 : g_pin->dio1, g_pin->rst, g_pin->busy, g_pin->tcxo);
 
     after_begin();
     s_ok = true;
@@ -989,8 +1338,13 @@ void lora_bg_set(bool on) { s_bg = on; LOGI("lora", "bg scan %s", on ? "on" : "o
 bool lora_bg_get()        { return s_bg; }
 
 void lora_status() {
-    LOGI("lora", "radio=%s busy=%d bg=%d board=%s pins nss%d dio%d rst%d busy%d tcxo%.1f",
-         s_ok ? "up" : "down", s_busy ? 1 : 0, s_bg ? 1 : 0, s_ok ? g_pin->name : "?",
-         g_pin->nss, g_pin->dio1, g_pin->rst, g_pin->busy, g_pin->tcxo);
+    LOGI("lora", "radio=%s chip=%s busy=%d bg=%d board=%s pins nss%d irq%d rst%d busy%d tcxo%.1f",
+         s_ok ? "up" : "down", s_radio.chip_name(), s_busy ? 1 : 0, s_bg ? 1 : 0,
+         s_ok ? g_pin->name : "?", g_pin->nss,
+         s_radio.is_sx1276() ? g_pin->dio0 : g_pin->dio1, g_pin->rst, g_pin->busy, g_pin->tcxo);
+    LOGI("lora", "region=%s fallback=%d duty %s=%lu/%lu %s=%lu/%lu ms/h",
+         REGIONS[s_region].name, s_fb_on ? 1 : 0,
+         band_cfg(0)->name, (unsigned long)s_duty[0].used_ms, (unsigned long)band_cfg(0)->limit_ms,
+         band_cfg(1)->name, (unsigned long)s_duty[1].used_ms, (unsigned long)band_cfg(1)->limit_ms);
 }
 #endif

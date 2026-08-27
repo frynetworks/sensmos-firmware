@@ -93,6 +93,81 @@ struct LoraPinout {
 #define DUTY_G1_LIMIT_MS      36000UL
 #define DUTY_G4_LIMIT_MS      360000UL
 
+// ══ Worldwide region plans ════════════════════════════════════
+// Same table as the ESP32 port (src/lora_config.h) — one row per region, gathering the
+// frequencies that used to be EU868 literals scattered through this file. The EU868 row
+// carries EXACTLY the previous literal values, so the default build's behaviour and its
+// log output do not move by a byte; tools/gate_duty_bands.py only ever runs EU868 and
+// must keep passing unmodified.
+//
+// Meshtastic channel 0 is derived with the upstream formula, meshtastic/firmware
+// src/mesh/RadioInterface.cpp:
+//   numChannels = floor((freqEnd - freqStart) / (bw/1000))
+//   channel_num = hash("LongFast") % numChannels        // hash = djb2, RadioInterface.cpp
+//   freq        = freqStart + bw/2000 + channel_num * (bw/1000)
+// for the LONG_FAST preset (BW 250 kHz). djb2("LongFast") = 130429955, hence:
+//   EU868  869.4 -869.65 -> 1 ch,   ch  0 -> 869.400 + 0.125 + 0.00 = 869.525
+//   US915  902.0 -928.0  -> 104 ch, ch 19 -> 902.000 + 0.125 + 4.75 = 906.875
+//   AU915  915.0 -928.0  -> 52 ch,  ch 19 -> 915.000 + 0.125 + 4.75 = 919.875
+//   AS923  920.0 -925.0  -> 20 ch,  ch 15 -> 920.000 + 0.125 + 3.75 = 923.875
+//   IN865  865.0 -867.0  -> 8 ch,   ch  3 -> 865.000 + 0.125 + 0.75 = 865.875
+//   KR920  920.0 -923.0  -> 12 ch,  ch 11 -> 920.000 + 0.125 + 2.75 = 922.875
+//   RU864  868.7 -869.2  -> 2 ch,   ch  1 -> 868.700 + 0.125 + 0.25 = 869.075
+// Band edges and Meshtastic power limits come from the `regions[]` table in that same
+// upstream file (regions EU_868, US, ANZ, TH, IN, KR, RU).
+//
+// The SENSMOS channel is the primary uplink channel of the matching LoRaWAN plan
+// (RP002-1.0.4): EU868 868.1 | US915 902.3 | AU915 915.2 | AS923-1 923.2 |
+// IN865 865.0625 | KR920 922.1 | RU864 868.9. Power is MIN(regulatory limit, 20 dBm) —
+// 20 dBm is the SX1276 PA_BOOST ceiling, so one row serves both radio families.
+//
+// Band model: two disjoint sub-bands per region, [0] for SENSMOS and [1] for Meshtastic,
+// resolved BY FREQUENCY (duty_for_freq) exactly as before.
+//   · limit_ms — airtime budget per hour window. EU868/RU864 have a real duty cycle
+//     (1% = 36 s/h, 10% = 360 s/h); FCC/AS regions run at 100% (3 600 000 ms), matching
+//     `dutyCycle 100` upstream — there the law limits dwell, not duty.
+//   · dwell_ms — cap on a SINGLE transmission (FCC 15.247 / AS923: 400 ms). SIMPLIFICATION:
+//     enforced on the SENSMOS band, where our SF7/BW125 frames (<=133 B) fit with room to
+//     spare. It is deliberately 0 on the Meshtastic band: the LongFast preset is SF11/BW250,
+//     about a second on air, so any dwell value there would block all mesh traffic. Upstream
+//     Meshtastic transmits that preset unchanged and interoperability requires the same;
+//     re-tuning SF/BW "to fit the dwell" would produce frames no neighbour can hear.
+struct LoraBand {
+    const char* name;
+    float       lo, hi;        // MHz, inclusive sub-band edges
+    uint32_t    limit_ms;      // airtime budget per hour window
+    uint32_t    dwell_ms;      // 0 = no single-transmission cap
+};
+struct LoraRegion {
+    const char* name;
+    float    smos_freq;        // SENSMOS uplink/beacon channel
+    int8_t   smos_power;       // dBm
+    float    mesh_freq;        // Meshtastic LongFast, channel 0
+    int8_t   mesh_power;       // dBm
+    LoraBand band[2];          // [0] SENSMOS band, [1] Meshtastic band
+};
+
+// EU868 MUST stay first: it is the default when NVS holds no region, and its band[0]
+// (g1) doubles as the "strictest" band that duty_for_freq charges channels outside the
+// table to (867.1 from LORA_BG_CHANNELS, for one) — same semantics as before.
+#define LORA_REGIONS { \
+  { "EU868",  868.1f,    14, 869.525f, 14, { { "g1", 868.0f,  868.6f,  DUTY_G1_LIMIT_MS, 0 }, \
+                                             { "g4", 869.4f,  869.65f, DUTY_G4_LIMIT_MS, 0 } } }, \
+  { "US915",  902.3f,    20, 906.875f, 20, { { "us1", 902.0f, 906.0f, 3600000UL, 400 }, \
+                                             { "us2", 906.0f, 928.0f, 3600000UL,   0 } } }, \
+  { "AU915",  915.2f,    20, 919.875f, 20, { { "au1", 915.0f, 919.0f, 3600000UL, 400 }, \
+                                             { "au2", 919.0f, 928.0f, 3600000UL,   0 } } }, \
+  { "AS923-1",923.2f,    16, 923.875f, 16, { { "as1", 920.0f, 923.5f, 3600000UL, 400 }, \
+                                             { "as2", 923.5f, 925.0f, 3600000UL,   0 } } }, \
+  { "IN865",  865.0625f, 20, 865.875f, 20, { { "in1", 865.0f, 865.5f, 3600000UL,   0 }, \
+                                             { "in2", 865.5f, 867.0f, 3600000UL,   0 } } }, \
+  { "KR920",  922.1f,    14, 922.875f, 14, { { "kr1", 920.0f, 922.5f, 3600000UL,   0 }, \
+                                             { "kr2", 922.5f, 923.0f, 3600000UL,   0 } } }, \
+  { "RU864",  868.9f,    14, 869.075f, 14, { { "ru1", 868.7f, 869.0f, DUTY_G1_LIMIT_MS, 0 }, \
+                                             { "ru2", 869.0f, 869.2f, DUTY_G1_LIMIT_MS, 0 } } }, \
+}
+#define LORA_REGION_DEFAULT   0        // EU868
+
 // Kept as the g1 limit: the SENSMOS link plan lives in g1, and existing references
 // to this name mean "the budget for the channel the link is transmitting on".
 #define LORA_LINK_DUTY_MS_H   DUTY_G1_LIMIT_MS
@@ -120,7 +195,10 @@ struct LoraPinout {
 //   freq  = freqStart(869.4) + bw/2000 + channel_num*(bw/1000), channel_num 0 → 869.525
 //   modem = LONG_FAST: BW 250 kHz, SF11, CR 4/5 (MeshRadio.h modemPresetToParams)
 //   sync  = 0x2b (RadioLibInterface.h), preamble 16 symbols (RadioInterface.h)
-// One packet at a time, TX'd from the same duty-cycle budget as SMOS traffic.
+// One packet at a time, TX'd from the Meshtastic sub-band's own duty-cycle budget.
+// MESH_FREQ / MESH_TX_POWER are the EU868 row's values: since the region toggle landed,
+// the carrier and the power ceiling are read from the active row at TX time, and these
+// literals remain as that row's source and as the default.
 #define MESH_FREQ             869.525f
 #define MESH_BW               250.0f
 #define MESH_SF               11

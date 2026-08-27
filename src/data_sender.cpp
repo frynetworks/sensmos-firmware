@@ -14,6 +14,8 @@
 #include "net_worker.h"
 #include "monitors.h"
 #include "log.h"
+#include "lora_scan.h"    // fallback + kolejka SMOSB — cialo pod #if LORA_ENABLED
+#include "mesh_tx.h"      // kolejka Meshtastica — j.w.
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <esp_random.h>
@@ -156,12 +158,67 @@ static void build_entity_payload(JsonDocument& doc, int& pub_count, int& user_co
 }
 
 // ── Batch ─────────────────────────────────────────────────────
-static void send_batch() {
-    if (!g_wifi_connected) return;
-    if (!ws_client_connected()) {
-        LOGD("net", "batch skipped — WS down");
-        g_last_send = millis();  // cooldown — nie spamuj prób co tick
+#if LORA_ENABLED
+// ── Dwustos w trybie awaryjnym (brak WiFi) ───────────────────────────────────
+// Ta sama paczka wychodzi w eter DWOMA drogami: jako ramki SMOSB na kanale SENSMOS i
+// jako pakiety Meshtastica na kanale mesh. Kolejki sa NIEZALEZNE — nieudane wstawienie
+// do mesh nie moze wstrzymac sciezki SENSMOS ani odwrotnie (nrf52840/src/data_sender.cpp).
+//
+// W eterze nie ma enc/GCM, ktore na WS daje autentycznosc ramki, wiec paczka jest
+// PODPISYWANA ECDSA, a sygnatura doklejana przed klamra zamykajaca — bez tego kazdy
+// moglby nadac dowolne odczyty w imieniu tego noda.
+static void lora_dispatch_batch(char* buf, size_t flen, int pub_count, int user_count) {
+    if (flen == 0 || flen >= TX_SCRATCH_LEN - 160) {   // miejsce na pole sig
+        LOGW("net", "batch payload overflow — nie wysylam po LoRa");
         return;
+    }
+    uint8_t hash[32];
+    {   // sha256 po DOKLADNIE tych bajtach, ktore poprzedzaja pole sig
+        char saved = buf[flen];
+        buf[flen] = 0;
+        sha256_string(buf, hash);
+        buf[flen] = saved;
+    }
+    uint8_t der[72]; size_t dl = 0;
+    if (!identity_sign(hash, der, &dl)) {
+        LOGW("net", "batch sign failed — nie wysylam po LoRa");
+        return;
+    }
+    char sig_hex[145];
+    bytes_to_hex(der, dl, sig_hex);
+    flen--;                                            // cofnij sie za zamykajaca '}'
+    flen += snprintf(buf + flen, TX_SCRATCH_LEN - flen, ",\"sig\":\"%s\"}", sig_hex);
+
+    if (lora_uplink_enqueue(buf, flen)) {
+        LOGI("net", "batch queued for LoRa uplink: %uB (pub:%d user:%d, sig %uB DER)",
+             (unsigned)flen, pub_count, user_count, (unsigned)dl);
+        g_pending_send = false;
+    } else {
+        LOGW("net", "uplink enqueue failed — retry after cooldown");
+    }
+    if (mesh_tx_enabled() && !mesh_uplink_enqueue(buf, flen))
+        LOGW("net", "mesh enqueue failed — previous mesh batch still in flight");
+}
+#endif
+
+static void send_batch() {
+#if LORA_ENABLED
+    // Tryb awaryjny: WiFi nie ma, ale radio dziala — paczka idzie w eter zamiast po WS.
+    const bool via_lora = lora_fallback_active();
+    if (via_lora && lora_uplink_pending()) {
+        LOGD("net", "batch skipped — previous uplink still in flight");
+        g_last_send = millis();
+        return;
+    }
+    if (!via_lora)
+#endif
+    {
+        if (!g_wifi_connected) return;
+        if (!ws_client_connected()) {
+            LOGD("net", "batch skipped — WS down");
+            g_last_send = millis();  // cooldown — nie spamuj prób co tick
+            return;
+        }
     }
 
     push_basics();
@@ -192,6 +249,9 @@ static void send_batch() {
                              // przebudowywany ~100x/s w nieskończoność (bez cooldownu)
     if (flen == 0 || flen >= TX_SCRATCH_LEN) { LOGW("net", "batch payload overflow — skipped"); return; }
 
+#if LORA_ENABLED
+    if (via_lora) { lora_dispatch_batch(final_payload, flen, pub_count, user_count); return; }
+#endif
     if (ws_client_send_raw(final_payload)) {
         LOGD("net", "batch sent %uB (pub:%d user:%d)", (unsigned)flen, pub_count, user_count);
         g_pending_send = false;
