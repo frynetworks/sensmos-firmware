@@ -5,6 +5,51 @@ Firmware ships via **OTA** (app-only bins served by the backend) and the **web f
 This file is the version history reconstructed from commits. Current version:
 `FW_VERSION` in `src/data_sender.h`.
 
+## 0.90 — 2026-08-27
+- **Dual-stack LoRa transport on ESP32** (`mesh_proto.*`, `mesh_tx.*`, `lora_scan.cpp`,
+  `data_sender.cpp`). When WiFi has been down for 3 minutes the radio build switches its
+  data path to the air: the same ECDSA-signed batch goes out both as chunked `SMOSB`
+  frames on the SENSMOS channel and as **Meshtastic** packets on the mesh channel,
+  time-division multiplexed on one radio (SMOS keeps priority; mesh only borrows a second
+  where SMOS did not transmit). The WiFi watchdog's 4-minute hard reboot is suppressed
+  while that transport is carrying traffic. Ported from the nRF52840 firmware; wire format
+  byte-identical (verified against `nrf52840/src/mesh_proto.cpp`).
+- **Worldwide region plans on both ESP32 and nRF52840** (`lora_config.h`, `set_region`).
+  `{"cmd":"set_region","region":"US915"}` selects EU868 (default), US915, AU915, AS923-1,
+  IN865, KR920 or RU864; the row drives the SENSMOS channel, the Meshtastic LongFast
+  channel (derived with the upstream Meshtastic channel formula, so nodes land on the same
+  carrier as real Meshtastic hardware), both power caps and the per-sub-band duty/dwell
+  model. Persisted in NVS; unknown names answer `bad_region` and change nothing. EU868
+  behaviour and log output are unchanged (`gate_duty_bands.py` passes unmodified).
+  - Region changes re-derive the active SENSMOS channel plan at boot, on `set_region`,
+    and against every backend `lora_cfg` (an out-of-band backend plan is replaced with the
+    region default and logged; an in-band one is kept) — caught on hardware: without this
+    the node kept transmitting on the old region's carrier while debiting the new
+    region's duty band.
+- **LilyGO T-Beam v1.1 support (plain ESP32 + SX1276)**. New `esp32-lora` build target
+  (`build-all.ps1`) with its own OTA/panel identity, distinct from the S3-based
+  `esp32s3-lora`; the radio layer abstracts SX1262 and SX1276 behind one call surface and
+  the boot probe powers the T-Beam's radio through its AXP192 PMU (LDO2, fail-safe
+  read-modify-write — a failed PMU read skips the row instead of blind-writing the enable
+  register, which would have cut the ESP32's own DC-DC1 core rail). Existing S3 boards
+  keep the same six pinouts in the same order.
+- **Fixed `OTA_CHIP` misreporting** (`ota.cpp`): any chip family compiled with
+  `LORA_ENABLED=1` used to claim the S3 LoRa OTA target — a plain-ESP32, N16R8 or C3 LoRa
+  build would all have reported `esp32s3-lora`. Chip family now wins over the LoRa flag,
+  matching `fw_digest.h`. Existing S3 LoRa builds are unaffected.
+- **Web flasher: plain-ESP32 LoRa manifest staged** (`firmware/manifest-esp32-lora.json`)
+  plus an upstream bug report (`docs/upstream-reports/webflasher-esp32-lora-manifest.md`)
+  — sensmos.com's flasher only declares `chipFamily "ESP32-S3"` for the LoRa image, so a
+  T-Beam v1.1 shows a false "not compatible". Regression check: `tools/check_fw_chip.py`.
+- **ESP8266 port moved out** to
+  [`frynetworks/sensmos-firmware-experimental`](https://github.com/frynetworks/sensmos-firmware-experimental)
+  (byte-for-byte, with its upstream bug reports) — its 28–36 KB realistic free heap sits
+  below the 60 KB baseline for supported boards, and the split keeps this fork clean for
+  upstream PRs.
+- `get_info` reports `region` and `lora_fallback` on radio builds; ESP32 duty-cycle
+  accounting is now per sub-band (matching the nRF port), so Meshtastic airtime no longer
+  starves the SENSMOS budget. New `tools/gate_duty_bands_esp32.py` hardware gate.
+
 ## 0.89 — 2026-08-22
 - **WebSocket watchdog** (`ws_client.cpp`). A node could end up with WiFi alive but the
   WS client wedged — connected to nothing, retrying nothing — and stay silent for hours

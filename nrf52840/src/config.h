@@ -2,8 +2,8 @@
 // SENSMOS nRF52840 config — subset of upstream config.h relevant to the LoRa-only node.
 #include "lora_config.h"
 
-// Wersja: baza upstream 0.89, sufiks -nrf1 odróżnia port w panelu/OTA.
-#define FW_BASE "0.89"
+// Wersja: baza upstream 0.90, sufiks -nrf1 odróżnia port w panelu/OTA.
+#define FW_BASE "0.90"
 #define FW_VERSION FW_BASE "-nrf1"
 
 #define MAX_ENTITY_LEN       28
