@@ -596,6 +596,9 @@ static void region_load() {
 // Przestraja plan kanalow po zmianie regionu. Definicja nizej, przy lora_link_set —
 // rusza ten sam stan s_link.
 static void region_apply_to_plan();
+// Czy na danym kanale wolno nadawac (mode 0 + w kopercie RF regionu). Definicja tamze;
+// link_tick potrzebuje jej wczesniej, zeby wstrzymac TX na kanalach nasluchu.
+static bool ch_tx_allowed(const LoraLinkCh& c);
 
 bool lora_region_set(const char* name) {
     if (!name || !name[0]) return false;
@@ -983,11 +986,26 @@ static void link_tick() {
         return;
     }
 
+    // Czy na TYM kanale wolno nadawac. Bez tego beacon i uplink szly takze wtedy, gdy link
+    // stal na kanale nasluchu obcego protokolu (mode 1) — radio bylo wtedy w trybie FSK
+    // (cfg_ch -> beginFSK), wiec ramka SMOS wychodzila jako FSK na czestotliwosci, ktorej
+    // mielismy tylko sluchac: nikt jej nie odbieral, a emisja byla realna. To bledne
+    // zachowanie istnialo, zanim doszedl region; walidacja planu tylko je obnazyla.
+    const bool tx_ok = ch_tx_allowed(c);
+    if (!tx_ok) {
+        static int warned_ch = -2;
+        if (warned_ch != s_cur_ch) {
+            warned_ch = s_cur_ch;
+            LOGI("lora", "kanal %.4f MHz (mode %u) jest tylko do nasluchu — TX wstrzymany",
+                 c.freq, c.mode);
+        }
+    }
+
     // Slot nadawania: sekunda 10 + k*7 w każdej minucie. Trafiamy w nią raz — seq rośnie,
     // więc podwójne wejście w tę samą sekundę wykluczamy znacznikiem ostatniej minuty.
     static uint32_t last_tx_min = 0;
     const uint32_t my_sec = LORA_LINK_SLOT0_S + (uint32_t)s_link.slot * LORA_LINK_SLOT_GAP_S;
-    if (s_link.beacon && sec_in_min == my_sec && (now / 60) != last_tx_min &&
+    if (tx_ok && s_link.beacon && sec_in_min == my_sec && (now / 60) != last_tx_min &&
         (s_link.beacon_s == 0 || (now % s_link.beacon_s) < 60)) {
         last_tx_min = now / 60;
         link_tx_beacon(c);
@@ -997,7 +1015,7 @@ static void link_tick() {
     // wokol rotacji kanalu.
     static uint32_t last_up_sec = 61;
     bool smos_tx_this_sec = false;
-    if (s_up_pending && sec_in_min != last_up_sec &&
+    if (tx_ok && s_up_pending && sec_in_min != last_up_sec &&
         sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
         last_up_sec = sec_in_min;
         uplink_tx_next(c);
@@ -1011,7 +1029,7 @@ static void link_tick() {
     // wiec dzieje sie najwyzej raz na sekunde i ZAWSZE oddaje radio na kanal SENSMOS,
     // zanim ponizej otworzy sie okno RX.
     static uint32_t last_mesh_sec = 61;
-    if (!smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
+    if (tx_ok && !smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
         sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
         last_mesh_sec = sec_in_min;
         // Meshtastic nadaje we WLASNYM podpasmie z wlasnym budzetem — ruch SMOS ani go
@@ -1075,16 +1093,68 @@ static void region_default_ch(LoraLinkCh* out) {
     out->mode = 0;
 }
 
-// true, gdy KAZDY kanal biezacego planu lezy w ktoryms podpasmie regionu.
-static bool plan_is_legal() {
+// Czy na tym kanale wolno NADAWAC w biezacym regionie.
+// Dwa warunki, oba konieczne:
+//  · mode == 0 — kanaly mode 1 (FSK) sluza WYLACZNIE do nasluchu obcych protokolow
+//    (wM-Bus itp., patrz cfg_ch). Odbior nie zajmuje eteru, wiec nie podlega duty ani
+//    limitom mocy; nadawanie na takim kanale byloby emisja tam, gdzie mielismy tylko sluchac.
+//  · czestotliwosc w kopercie RF regionu — NIE w podpasmach duty. Podpasma opisuja
+//    ksiegowanie i nie pokrywaja calego planu (867.1 to zwykly kanal EU868 lezacy poza g1/g4).
+static bool ch_tx_allowed(const LoraLinkCh& c) {
+    if (c.mode != 0) return false;
+    return c.freq >= REGIONS[s_region].rf_lo && c.freq <= REGIONS[s_region].rf_hi;
+}
+
+// Ile kanalow planu nadaje sie do NADAWANIA (reszta to nasluch).
+static uint8_t plan_tx_ch_count() {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < s_link.n_ch; i++) if (ch_tx_allowed(s_link.ch[i])) n++;
+    return n;
+}
+
+// Porzadkuje plan po zmianie regionu / po planie z BE. Per kanal, NIE calym blokiem:
+// wyrzucenie calej tablicy zabijalo nasluch obcych protokolow (kanaly FSK), ktory z
+// regionem nie ma nic wspolnego. Zasady:
+//   · kanaly mode 1 (nasluch) zostaja ZAWSZE — brak ekspozycji regulacyjnej;
+//   · kanaly mode 0 w kopercie regionu zostaja;
+//   · kanaly mode 0 poza koperta sa USUWANE (kazdy z osobna, z logiem);
+//   · gdy po tym nie zostal zaden kanal do nadawania, DOKLADAMY domyslny kanal regionu,
+//     zeby beacon i uplink mialy legalny dom, a nasluch przetrwal nietkniety.
+// Zwraca true, gdy plan zostal zmieniony.
+static bool plan_sanitize() {
+    bool changed = false;
+    uint8_t keep = 0;
     for (uint8_t i = 0; i < s_link.n_ch; i++) {
-        const float f = s_link.ch[i].freq;
-        bool inside = false;
-        for (int b = 0; b < 2; b++)
-            if (f >= band_cfg(b)->lo && f <= band_cfg(b)->hi) { inside = true; break; }
-        if (!inside) return false;
+        const LoraLinkCh& c = s_link.ch[i];
+        const bool rx_only = (c.mode != 0);
+        const bool in_env  = (c.freq >= REGIONS[s_region].rf_lo &&
+                              c.freq <= REGIONS[s_region].rf_hi);
+        if (rx_only || in_env) {
+            if (keep != i) s_link.ch[keep] = c;
+            keep++;
+            continue;
+        }
+        LOGW("lora", "kanal %.4f MHz (mode %u) jest POZA koperta RF regionu %s (%.1f-%.1f MHz) "
+                     "— usuwam z planu", c.freq, c.mode, REGIONS[s_region].name,
+             REGIONS[s_region].rf_lo, REGIONS[s_region].rf_hi);
+        changed = true;
     }
-    return true;
+    s_link.n_ch = keep;
+
+    if (plan_tx_ch_count() == 0) {
+        if (s_link.n_ch >= LORA_LINK_MAX_CH) {
+            LOGW("lora", "plan pelny (%u kanalow) — kanal nasluchu %.4f MHz ustepuje miejsca "
+                 "kanalowi nadawczemu", s_link.n_ch, s_link.ch[LORA_LINK_MAX_CH - 1].freq);
+            s_link.n_ch = LORA_LINK_MAX_CH - 1;
+        }
+        region_default_ch(&s_link.ch[s_link.n_ch]);
+        s_link.n_ch++;
+        LOGW("lora", "plan nie ma kanalu do nadawania w %s — dokladam domyslny %.4f MHz "
+                     "(kanaly nasluchu zostaja)", REGIONS[s_region].name,
+             REGIONS[s_region].smos_freq);
+        changed = true;
+    }
+    return changed;
 }
 
 static void install_region_default_plan() {
@@ -1101,14 +1171,13 @@ static void install_region_default_plan() {
 static void region_apply_to_plan() {
     if (!s_link.n_ch) return;                // planu jeszcze nie ma — domyslka zrobi swoje
     if (!s_plan_from_be) { install_region_default_plan(); return; }
-    if (plan_is_legal()) {
+    if (plan_sanitize()) {
+        LOGW("lora", "zmiana regionu: plan z BE dostosowany do %s (%u kanalow, %u do nadawania)",
+             REGIONS[s_region].name, s_link.n_ch, plan_tx_ch_count());
+        s_cur_ch = -1;
+    } else {
         LOGI("lora", "zmiana regionu: plan z BE miesci sie w %s — zostaje", REGIONS[s_region].name);
-        return;
     }
-    LOGW("lora", "zmiana regionu: plan z BE (%.4f MHz) jest POZA %s — podmieniony na "
-                 "domyslke regionu %.4f MHz", s_link.ch[0].freq, REGIONS[s_region].name,
-         REGIONS[s_region].smos_freq);
-    install_region_default_plan();
 }
 
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
@@ -1125,16 +1194,10 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
             s_plan_from_be = true;
             // Walidacja TAKZE tutaj, nie tylko w set_region: BE dosyla lora_cfg po kazdym
             // identify, wiec nieaktualny plan EU po cichu cofalby zmiane regionu przy
-            // najblizszej ramce.
-            if (!plan_is_legal()) {
-                LOGW("lora", "plan z lora_cfg (%.4f MHz) jest POZA regionem %s — podmieniony "
-                             "na domyslke regionu %.4f MHz", s_link.ch[0].freq,
-                     REGIONS[s_region].name, REGIONS[s_region].smos_freq);
-                LoraLinkCh d;
-                region_default_ch(&d);
-                s_link.ch[0] = d;
-                s_link.n_ch  = 1;
-            }
+            // najblizszej ramce. Porzadkujemy PER KANAL — kanaly nasluchu przezywaja.
+            if (plan_sanitize())
+                LOGW("lora", "plan z lora_cfg dostosowany do regionu %s (%u kanalow, %u do nadawania)",
+                     REGIONS[s_region].name, s_link.n_ch, plan_tx_ch_count());
         } else {
             s_plan_from_be = false;
         }
@@ -1213,12 +1276,12 @@ void lora_fallback_tick() {
         install_region_default_plan();              // ta sama sciezka co przy zmianie regionu
         LOGI("lora", "fallback: brak planu z BE — kanal domyslny %s %.4f MHz SF%u",
              REGIONS[s_region].name, s_link.ch[0].freq, s_link.ch[0].sf);
-    } else if (!plan_is_legal()) {
+    } else if (plan_sanitize()) {
         // Plan z BE moze pochodzic z czasow innego regionu. Wejscie w tryb awaryjny to
         // moment, w ktorym zaczynamy NADAWAC z tego planu — nie wolno tego zrobic poza pasmem.
-        LOGW("lora", "fallback: plan z BE (%.4f MHz) jest POZA regionem %s — domyslka regionu",
-             s_link.ch[0].freq, REGIONS[s_region].name);
-        install_region_default_plan();
+        LOGW("lora", "fallback: plan z BE dostosowany do regionu %s (%u kanalow, %u do nadawania)",
+             REGIONS[s_region].name, s_link.n_ch, plan_tx_ch_count());
+        s_cur_ch = -1;
     }
     s_link.on = true;
     s_cur_ch  = -1;

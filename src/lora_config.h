@@ -222,26 +222,44 @@ struct LoraRegion {
     int8_t   smos_power;       // dBm
     float    mesh_freq;        // Meshtastic LongFast, kanal 0
     int8_t   mesh_power;       // dBm
+    // Calkowity zakres RF regionu — NIE to samo co podpasma duty ponizej.
+    // band[] modeluje KSIEGOWANIE airtime i celowo pokrywa tylko te dwa podpasma, na
+    // ktorych nadajemy; duty_for_freq od zawsze ma tolerancyjny fallback ("kanal spoza
+    // tablicy -> obciaz najostrzejsze pasmo"), bo plan moze legalnie zawierac kanaly,
+    // ktorych nie ksiegujemy osobno — 867.1 z LORA_BG_CHANNELS to zwykly kanal EU868.
+    // Na pytanie "czy WOLNO tu nadawac" odpowiada WYLACZNIE ta koperta. Uzycie band[]
+    // w tej roli odrzucalo poprawne plany EU868.
+    float    rf_lo, rf_hi;
     LoraBand band[2];          // [0] pasmo SENSMOS, [1] pasmo Meshtastic
 };
 
 // EU868 MUSI byc pierwszy: to domyslny region przy braku wpisu w NVS, a jego wiersz [0]
 // (g1) jest jednoczesnie pasmem "najostrzejszym", na ktore duty_for_freq odsyla kanaly
 // spoza tablicy (np. 867.1 z LORA_BG_CHANNELS) — tak samo jak przed uogolnieniem.
+// Koperta rf_lo/rf_hi to CALE pasmo ISM regionu (nie podpasma duty):
+//   EU868 863-870 (ERC 70-03) | US915 902-928 (FCC 15.247) | AU915 915-928 (AS/NZS 4268)
+//   AS923-1 920-925 | IN865 865-867 | KR920 920-923.5 | RU864 864-870
 #define LORA_REGIONS { \
-  { "EU868",  868.1f,    14, 869.525f, 14, { { "g1", 868.0f,  868.6f,   36000UL,   0 }, \
+  { "EU868",  868.1f,    14, 869.525f, 14, 863.0f, 870.0f, \
+                                           { { "g1", 868.0f,  868.6f,   36000UL,   0 }, \
                                              { "g4", 869.4f,  869.65f, 360000UL,   0 } } }, \
-  { "US915",  902.3f,    20, 906.875f, 20, { { "us1", 902.0f, 906.0f, 3600000UL, 400 }, \
+  { "US915",  902.3f,    20, 906.875f, 20, 902.0f, 928.0f, \
+                                           { { "us1", 902.0f, 906.0f, 3600000UL, 400 }, \
                                              { "us2", 906.0f, 928.0f, 3600000UL,   0 } } }, \
-  { "AU915",  915.2f,    20, 919.875f, 20, { { "au1", 915.0f, 919.0f, 3600000UL, 400 }, \
+  { "AU915",  915.2f,    20, 919.875f, 20, 915.0f, 928.0f, \
+                                           { { "au1", 915.0f, 919.0f, 3600000UL, 400 }, \
                                              { "au2", 919.0f, 928.0f, 3600000UL,   0 } } }, \
-  { "AS923-1",923.2f,    16, 923.875f, 16, { { "as1", 920.0f, 923.5f, 3600000UL, 400 }, \
+  { "AS923-1",923.2f,    16, 923.875f, 16, 920.0f, 925.0f, \
+                                           { { "as1", 920.0f, 923.5f, 3600000UL, 400 }, \
                                              { "as2", 923.5f, 925.0f, 3600000UL,   0 } } }, \
-  { "IN865",  865.0625f, 20, 865.875f, 20, { { "in1", 865.0f, 865.5f, 3600000UL,   0 }, \
+  { "IN865",  865.0625f, 20, 865.875f, 20, 865.0f, 867.0f, \
+                                           { { "in1", 865.0f, 865.5f, 3600000UL,   0 }, \
                                              { "in2", 865.5f, 867.0f, 3600000UL,   0 } } }, \
-  { "KR920",  922.1f,    14, 922.875f, 14, { { "kr1", 920.0f, 922.5f, 3600000UL,   0 }, \
+  { "KR920",  922.1f,    14, 922.875f, 14, 920.0f, 923.5f, \
+                                           { { "kr1", 920.0f, 922.5f, 3600000UL,   0 }, \
                                              { "kr2", 922.5f, 923.0f, 3600000UL,   0 } } }, \
-  { "RU864",  868.9f,    14, 869.075f, 14, { { "ru1", 868.7f, 869.0f,   36000UL,   0 }, \
+  { "RU864",  868.9f,    14, 869.075f, 14, 864.0f, 870.0f, \
+                                           { { "ru1", 868.7f, 869.0f,   36000UL,   0 }, \
                                              { "ru2", 869.0f, 869.2f,   36000UL,   0 } } }, \
 }
 #define LORA_REGION_DEFAULT   0        // EU868
