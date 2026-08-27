@@ -991,13 +991,15 @@ static void link_tick() {
     // (cfg_ch -> beginFSK), wiec ramka SMOS wychodzila jako FSK na czestotliwosci, ktorej
     // mielismy tylko sluchac: nikt jej nie odbieral, a emisja byla realna. To bledne
     // zachowanie istnialo, zanim doszedl region; walidacja planu tylko je obnazyla.
+    // Dotyczy WYLACZNIE nadawania SENSMOS (beacon + uplink SMOSB), bo tylko one nadaja
+    // NA TYM kanale. Meshtastic ma osobna bramke nizej — patrz komentarz tamze.
     const bool tx_ok = ch_tx_allowed(c);
     if (!tx_ok) {
         static int warned_ch = -2;
         if (warned_ch != s_cur_ch) {
             warned_ch = s_cur_ch;
-            LOGI("lora", "kanal %.4f MHz (mode %u) jest tylko do nasluchu — TX wstrzymany",
-                 c.freq, c.mode);
+            LOGI("lora", "kanal %.4f MHz (mode %u) jest tylko do nasluchu — TX SENSMOS "
+                 "wstrzymany (mesh nadaje dalej na wlasnym kanale)", c.freq, c.mode);
         }
     }
 
@@ -1028,8 +1030,14 @@ static void link_tick() {
     // drugiego w polowie pakietu. Przestrojenie jest drogie (~0,7 s SF11 plus dwa begin()),
     // wiec dzieje sie najwyzej raz na sekunde i ZAWSZE oddaje radio na kanal SENSMOS,
     // zanim ponizej otworzy sie okno RX.
+    // CELOWO bez tx_ok: mesh_tx_next NIE nadaje na kanale `c` — przestraja radio na wlasna
+    // czestotliwosc regionu (rg->mesh_freq, z definicji w kopercie RF) i wraca. Wiazanie go
+    // z tx_ok kanalu LINK wstrzymywalo mesh na cale okno postoju za kazdym razem, gdy
+    // rotacja stanela na kanale nasluchu — przy domyslnych 10 min/kanal to realna strata
+    // przepustowosci na planach mieszanych, bez zadnego zysku regulacyjnego. Mesh ma
+    // wlasny budzet duty (mbi ponizej) i wlasne pasmo.
     static uint32_t last_mesh_sec = 61;
-    if (tx_ok && !smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
+    if (!smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
         sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
         last_mesh_sec = sec_in_min;
         // Meshtastic nadaje we WLASNYM podpasmie z wlasnym budzetem — ruch SMOS ani go

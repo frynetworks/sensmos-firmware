@@ -1002,12 +1002,15 @@ static void link_tick() {
     // FSK on a frequency we only meant to monitor: nothing could receive it and the
     // emission was real. That behaviour predates the region work; plan validation only
     // brought it to light.
+    // Applies ONLY to SENSMOS transmissions (beacon + SMOSB uplink), because only those go
+    // out ON THIS channel. Meshtastic has its own gate below — see the comment there.
     const bool tx_ok = ch_tx_allowed(c);
     if (!tx_ok) {
         static int warned_ch = -2;
         if (warned_ch != s_cur_ch) {
             warned_ch = s_cur_ch;
-            LOGI("lora", "channel %.4f MHz (mode %u) is listen-only — TX held", c.freq, c.mode);
+            LOGI("lora", "channel %.4f MHz (mode %u) is listen-only — SENSMOS TX held "
+                 "(mesh keeps transmitting on its own channel)", c.freq, c.mode);
         }
     }
 
@@ -1036,8 +1039,14 @@ static void link_tick() {
     // preempts the other mid-packet. The retune is expensive (~0.7 s of SF11 airtime
     // plus two begin() calls), so it happens at most once per second and always
     // hands the radio back on the SENSMOS channel before the RX window below.
+    // DELIBERATELY without tx_ok: mesh_tx_next does NOT transmit on channel `c` — it retunes
+    // the radio to the region's own Meshtastic frequency (rg->mesh_freq, inside the RF
+    // envelope by construction) and hands it back. Tying it to the LINK channel's tx_ok
+    // withheld mesh for a whole dwell every time rotation parked on a listen-only channel —
+    // at the default 10 min/channel that is a real throughput loss on mixed plans, for no
+    // regulatory gain. Mesh has its own duty budget (mbi below) and its own band.
     static uint32_t last_mesh_sec = 61;
-    if (tx_ok && !smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
+    if (!smos_tx_this_sec && mesh_uplink_pending() && sec_in_min != last_mesh_sec &&
         sec_in_min > my_sec && sec_in_min < 60 - LORA_LINK_GUARD_S) {
         last_mesh_sec = sec_in_min;
         // Meshtastic transmits in g4, which has its OWN 10% allowance — SMOS traffic
