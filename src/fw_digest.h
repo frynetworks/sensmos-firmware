@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include "lora_config.h"   // LORA_ENABLED — decyduje o FWD_CHIP (nizej), tak samo jak w ota.cpp
 
 // ── Odcisk działającego firmware ─────────────────────────────────────────────
 //
@@ -25,7 +26,14 @@
 // Wariant płytki — ta sama logika co przy OTA, bo BE musi wiedzieć, KTÓRY obraz
 // porównać (esp32s3 i esp32s3-n16r8 to dwa różne pliki).
 #if CONFIG_IDF_TARGET_ESP32
-  #define FWD_CHIP "esp32"
+  #if LORA_ENABLED
+    // KNOWN-ISSUES #6 (LX6 wariant): zwykly ESP32 (np. LilyGO T-Beam v1.1) z SX1262 to
+    // rowniez osobny target OTA/panel "esp32-lora" — ten sam powod co "esp32s3-lora"
+    // nizej, self-report musi sie zgadzac z tym, co widzi BE/flasher.
+    #define FWD_CHIP "esp32-lora"
+  #else
+    #define FWD_CHIP "esp32"
+  #endif
 #elif CONFIG_IDF_TARGET_ESP32S3
   #ifdef CONFIG_SPIRAM_MODE_OCT
     #define FWD_CHIP "esp32s3-n16r8"

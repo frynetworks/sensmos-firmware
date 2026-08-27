@@ -1,0 +1,13 @@
+{
+  "name": "Sensmos Node (LoRa, ESP32)",
+  "version": "latest",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "https://raw.githubusercontent.com/frynetworks/sensmos-firmware/main/firmware/sensmos-esp32-lora.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

@@ -36,6 +36,9 @@ $fqbns = [ordered]@{
   'esp32c3' = 'esp32:esp32:esp32c3:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
   # ── warianty radiowe (SX1262) ── ten sam chip S3, wlasny target OTA "esp32s3-lora"
   'esp32s3-lora'        = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
+  # LoRa na zwyklym ESP32 (LX6, np. LilyGO T-Beam v1.1) — fqbn identyczny z targetem
+  # 'esp32', wlasny target OTA "esp32-lora" (patrz ota.cpp/fw_digest.h).
+  'esp32-lora'          = 'esp32:esp32:esp32:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240,FlashMode=qio,FlashFreq=80'
   'esp32s2' = 'esp32:esp32:esp32s2:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
   'esp32c6' = 'esp32:esp32:esp32c6:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
 }
@@ -45,6 +48,7 @@ $fqbns = [ordered]@{
 # osobnego builda per plytka. Nowa plytka = wiersz w LORA_PINOUTS, nie nowy target.
 $defines = @{
   'esp32s3-lora' = '-DLORA_ENABLED=1'
+  'esp32-lora'   = '-DLORA_ENABLED=1'
 }
 
 # Domyslnie TYLKO flota — warianty radiowe trzeba wybrac jawnie albo wziac 'all',
