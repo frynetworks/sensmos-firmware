@@ -16,4 +16,11 @@ void ble_load_config();  // load persisted config (owner/pin/backend)
 void ble_start();
 void ble_stop();
 void ble_tick();         // dispatch queued command in loop() context
+
+// Boot self-test: pins the canonical register message, the register proof and the
+// trust_round hash to values computed off-device from the ESP32 formats, so a drift in the
+// signed bytes fails loudly instead of silently breaking backend verification.
+// Prints "[SELFTEST] ceremony=PASS|FAIL ..." — greppable like the other self-tests.
+// Pure string/hash work, no radio: called from ble_load_config(), before ble_start().
+bool ble_ceremony_selftest();
 #endif
