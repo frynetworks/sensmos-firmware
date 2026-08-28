@@ -33,6 +33,11 @@
 // pinoutów znanych z Meshtastica (pełna tabela: DOCS/dev/LORA-PINOUTS.md).
 
 #include <stdint.h>
+// sdkconfig.h wnosi CONFIG_IDF_TARGET_* — bez niego #if defined(CONFIG_IDF_TARGET_ESP32)
+// nizej jest ZAWSZE falszywe i goly ESP32 dostaje tablice pinoutow S3 (piny 6-11 = SPI flash),
+// co wiesza sonde radia w petli TG1WDT jeszcze przed wierszem T-Beama. Ten sam typ pulapki
+// co w fw_digest.h (0.90): makro rodziny musi byc widoczne, zanim sie je testuje.
+#include <sdkconfig.h>
 
 // Rodzina układu radiowego. Do 0.89 tablica opisywala WYLACZNIE SX1262 i typ byl domyslny;
 // T-Beam v1.1 (SX1276) wymusil jawne pole, bo obie rodziny roznia sie w RadioLib sygnaturami
