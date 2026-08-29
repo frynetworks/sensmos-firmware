@@ -164,6 +164,10 @@ static void on_disconnect(uint16_t, uint8_t reason) {
     // Bluefruit restartOnDisconnect(true) resumes advertising by itself.
 }
 
+// Fills the 1-slot queue. The check-then-act on s_cmd_pending is NOT atomic, so every
+// caller must run on the same task — see the producer-context note in ble_start(). The
+// consumer (ble_tick, loop task) only ever clears s_cmd_pending after the command has been
+// fully handled, so a single producer cannot race the consumer either.
 static void queue_cmd(const uint8_t* data, uint16_t len) {
     if (!len) return;
     if (s_cmd_pending) { LOGW("ble", "busy — write rejected"); return; }
@@ -175,29 +179,11 @@ static void queue_cmd(const uint8_t* data, uint16_t len) {
     s_cmd_pending = true;
 }
 
-// Guard against the same bytes being delivered twice. An authorized Write Request is
-// answered (and queued) in on_write_authorize below; should this SoftDevice build ALSO
-// raise BLE_GATTS_EVT_WRITE for it, on_write would queue a second copy. Drop a
-// byte-identical repeat seen within the window. Write-without-response never sets these,
-// so it is unaffected.
-#define AUTH_DEDUP_MS 50
-static uint32_t s_auth_wr_ms  = 0;
-static uint16_t s_auth_wr_len = 0;
-static uint32_t s_auth_wr_fnv = 0;
-
-static uint32_t fnv1a(const uint8_t* d, uint16_t n) {
-    uint32_t h = 2166136261UL;
-    while (n--) { h ^= *d++; h *= 16777619UL; }
-    return h;
-}
-
+// Serves two delivery paths, both on the "BLE" task: a completed long write (the framework
+// calls this itself from the EXEC_WRITE_REQ_NOW case) and write-without-response, which the
+// SoftDevice reports as an ordinary BLE_GATTS_EVT_WRITE. Authorized Write Requests do NOT
+// arrive here — see on_write_authorize.
 static void on_write(uint16_t, BLECharacteristic*, uint8_t* data, uint16_t len) {
-    if (!len) return;
-    if (s_auth_wr_len == len && (uint32_t)(millis() - s_auth_wr_ms) < AUTH_DEDUP_MS &&
-        s_auth_wr_fnv == fnv1a(data, len)) {
-        s_auth_wr_len = 0;                 // one-shot: only the immediate echo is dropped
-        return;
-    }
     queue_cmd(data, len);
 }
 
@@ -227,11 +213,13 @@ static void on_write_authorize(uint16_t conn_hdl, BLECharacteristic* chr,
     reply.params.write.p_data      = request->data;
     sd_ble_gatts_rw_authorize_reply(conn_hdl, &reply);
 
-    // The authorization event replaces BLE_GATTS_EVT_WRITE for this operation, so the
-    // payload has to be taken here — on_write will not fire for it.
-    s_auth_wr_ms  = millis();
-    s_auth_wr_len = request->len;
-    s_auth_wr_fnv = fnv1a(request->data, request->len);
+    // The authorization event REPLACES BLE_GATTS_EVT_WRITE for this operation, so the
+    // payload has to be taken here — on_write will not fire for it. Two independent
+    // confirmations in the framework: ble_gatts.h:301-303 makes `update` mandatory because
+    // "the data to be written needs to be stored and later provided by the application",
+    // and the EXEC_WRITE_REQ_NOW case at BLECharacteristic.cpp:497-505 invokes _wr_cb by
+    // hand after replying — which would double-fire if the SoftDevice also raised a write
+    // event. BLEDfu likewise consumes its payload here and registers no write callback.
     queue_cmd(request->data, request->len);
 }
 
@@ -668,13 +656,29 @@ void ble_start() {
     s_char_w->setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
     s_char_w->setPermission(SECMODE_OPEN, SECMODE_OPEN);
     s_char_w->setMaxLen(512);
-    s_char_w->setWriteCallback(on_write);
+    // BOTH write callbacks take useAdaCallback=false, and that is load-bearing twice over.
+    //
+    // Single producer context: with the default (true) the framework defers the callback to
+    // the "Callback" task (TASK_PRIO_NORMAL) while the authorize callback below runs on the
+    // "BLE" task (TASK_PRIO_HIGH, bluefruit.cpp:473 — SD_EVT_IRQHandler only gives a
+    // semaphore, it dispatches nothing). Two producer tasks on one unguarded 1-slot queue is
+    // a data race: "BLE" preempts "Callback" at any instruction, so a long-write `register`
+    // being copied could be torn in half by a short command arriving mid-memcpy, or silently
+    // dropped as "busy". With false, both callbacks are invoked inline from
+    // BLECharacteristic::_eventHandler on the "BLE" task, which drains events sequentially
+    // and cannot preempt itself — the race is gone by construction rather than by locking,
+    // so no critical section is needed in queue_cmd.
+    //
+    // Payload integrity: the deferred path copies only sizeof(ble_gatts_evt_write_t)
+    // (BLECharacteristic.cpp:447), whose data[] is a 1-byte placeholder, so an authorized
+    // write's JSON would arrive truncated to its first character. BLEDfu gets away with the
+    // default because it only ever reads data[0].
+    //
+    // Both callbacks still do nothing but reply and copy; the JSON parse and the ECDSA
+    // signature stay in ble_tick() on the loop task.
+    s_char_w->setWriteCallback(on_write, false);
     // Enables BLE long write — see on_write_authorize. Must be installed before begin(),
     // which is what publishes attr_meta (and its wr_auth bit) to the SoftDevice.
-    // useAdaCallback MUST be false: the deferred path copies only sizeof(ble_gatts_evt_write_t)
-    // (BLECharacteristic.cpp:447), whose data[] is a 1-byte placeholder, so the JSON payload
-    // would arrive truncated to its first character. BLEDfu gets away with the default
-    // because it only ever reads data[0].
     s_char_w->setWriteAuthorizeCallback(on_write_authorize, false);
     s_char_w->begin();
 
