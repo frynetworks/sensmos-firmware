@@ -142,6 +142,14 @@ struct LoraPinout {
 #define LORA_LINK_GUARD_S     3       // ±3 s wokół zmiany kanału: nikt nie nadaje (tam robimy sweep)
 #define LORA_LINK_SLOT0_S     10      // pierwszy slot beaconu: 10 s po pełnej minucie
 #define LORA_LINK_SLOT_GAP_S  7       // odstęp między slotami nadawców
+
+// Ile slotow faktycznie miesci sie w minucie. Okno uplinku to (my_sec, 60-GUARD), a
+// my_sec = SLOT0 + slot*GAP, wiec przy slocie 7 wychodzi my_sec=59 i okno jest PUSTE:
+// beacon (rowno w my_sec) leci dalej, ale SMOSB i mesh nie maja ani jednej sekundy i
+// paczka wisi w kolejce na zawsze — potwierdzone na T-Beamie, ktoremu BE dal slot 7.
+// 5 slotow => my_sec <= 38, czyli zawsze zostaje >= 18 s na uplink. Tyle samo slotow
+// liczy port nRF ((id % 16) % 5), wiec oba porty rozkladaja sie tak samo.
+#define LORA_LINK_SLOTS       5
 #define LORA_LINK_TX_POWER    14      // dBm — 14 = limit EU868 (ERP 25 mW) dla 868.1/.3/.5
 
 // Duty cycle EU868: 1% na godzinę w podpaśmie. Licznik pilnuje budżetu ZAMIAST dobrej woli —
