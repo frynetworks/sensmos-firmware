@@ -3,7 +3,7 @@
 #include "lora_config.h"
 
 // Wersja: baza upstream 0.90, sufiks -nrf1 odróżnia port w panelu/OTA.
-#define FW_BASE "0.90"
+#define FW_BASE "0.91"
 #define FW_VERSION FW_BASE "-nrf1"
 
 #define MAX_ENTITY_LEN       28

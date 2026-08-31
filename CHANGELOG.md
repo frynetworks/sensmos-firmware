@@ -5,6 +5,23 @@ Firmware ships via **OTA** (app-only bins served by the backend) and the **web f
 This file is the version history reconstructed from commits. Current version:
 `FW_VERSION` in `src/data_sender.h`.
 
+## 0.91 — 2026-08-31 (E2E pending)
+- **nRF52840 registration ceremony over BLE** (merge of `nrf-ceremony-port`,
+  `nrf52840/src/ble_config.cpp`/`.h`): BLE long-write support so the 305-byte
+  ESP32-canonical `register` payload fits through the nRF's MTU-247 framework ceiling,
+  plus the trust/wallet ceremony (PREP/EXEC command flow) and a single producer context
+  for the BLE command queue (no cross-context races on the shared command buffer).
+- **T-Beam v1.1 boot loop fixed** (`src/lora_config.h`): the per-family LoRa pinout gate
+  tested `CONFIG_IDF_TARGET_ESP32` without including `<sdkconfig.h>`, so on plain ESP32
+  the S3 pinout rows (incl. GPIO 6-11 = SPI flash) were compiled in and the tbeam-v1.1
+  row was excluded — probing flash pins hung the board into the TG1 watchdog.
+- **Dead uplink/mesh window on backend slots 6–15 fixed** (`src/lora_config.h`,
+  `src/lora_scan.cpp`): `LORA_LINK_SLOTS 5` + `slot_eff = slot % LORA_LINK_SLOTS`; a
+  backend-assigned slot ≥6 used to produce an empty TX window (my_sec past the guard).
+- **LoRa fallback now transmits without a backend time base** (`src/lora_scan.cpp`):
+  `link_now()` falls back WS epoch → NTP → 0, so link_tick/link_on_frame/link_tx_beacon/
+  uplink_tx_next keep working when the node never reached the backend this boot.
+
 ## 0.90 — 2026-08-27
 - **Dual-stack LoRa transport on ESP32** (`mesh_proto.*`, `mesh_tx.*`, `lora_scan.cpp`,
   `data_sender.cpp`). When WiFi has been down for 3 minutes the radio build switches its
