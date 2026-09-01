@@ -591,19 +591,23 @@ bool ble_ceremony_selftest() {
     // command can be in flight, and keeps the fixtures off both the stack and .bss.
     char* msg = s_buf.reg.message;
     ceremony_register_msg(msg, sizeof(s_buf.reg.message), DEV, OWN, NON);
+    // Compare before touching s_buf.round: round.input aliases reg.message at union
+    // offset 0, so the round call below overwrites msg (the per-command safety contract
+    // above does not hold inside this one function).
+    bool msg_ok = !strcmp(msg, EXP_MSG);
+    size_t msg_len = strlen(msg);
 
     char proof[65], r[65];
     ceremony_proof_hex(proof, s_buf.reg.proof_input, sizeof(s_buf.reg.proof_input), NON, SIG, DEV);
     ceremony_round_hex(r, s_buf.round.input, sizeof(s_buf.round.input), CHA, DEV);
 
-    bool msg_ok   = !strcmp(msg, EXP_MSG);
     bool proof_ok = !strcmp(proof, EXP_PROOF);
     bool round_ok = !strcmp(r, EXP_ROUND);
     bool ok = msg_ok && proof_ok && round_ok;
 
     Serial.printf("[SELFTEST] ceremony=%s msg=%d proof=%d round=%d msg_len=%u\n",
                   ok ? "PASS" : "FAIL", (int)msg_ok, (int)proof_ok, (int)round_ok,
-                  (unsigned)strlen(msg));
+                  (unsigned)msg_len);
     if (!ok) {
         // Direct writes, not Serial.printf: the 215-byte message overruns printf's
         // vararg buffer and the tail comes out corrupted (see serial_cmd.cpp:123).
