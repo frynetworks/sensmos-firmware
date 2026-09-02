@@ -5,7 +5,7 @@ Firmware ships via **OTA** (app-only bins served by the backend) and the **web f
 This file is the version history reconstructed from commits. Current version:
 `FW_VERSION` in `src/data_sender.h`.
 
-## 0.91 — 2026-08-31 (E2E pending)
+## 0.91 — 2026-08-31 (E2E verified 2026-09-02)
 - **nRF52840 registration ceremony over BLE** (merge of `nrf-ceremony-port`,
   `nrf52840/src/ble_config.cpp`/`.h`): BLE long-write support so the 305-byte
   ESP32-canonical `register` payload fits through the nRF's MTU-247 framework ceiling,
