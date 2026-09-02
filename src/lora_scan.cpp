@@ -12,6 +12,9 @@
 #include "wifi_manager.h"
 #include "mesh_proto.h"
 #include "mesh_tx.h"
+#include "ntp_time.h"   // link_now() — zapasowa podstawa czasu, gdy WS nie zyje (fallback)
+
+static uint32_t link_now();     // definicja przy link_tick; uzywana tez przez sciezki TX/RX
 #include <mbedtls/md.h>
 
 static const LoraPinout PINOUTS[] = LORA_PINOUTS;
@@ -700,7 +703,7 @@ static void link_flush_rx() {
 // Odebrana ramka → bufor. Nasze beacony rozpoznajemy TU (BE nie ma zgadywać):
 // 0xE0 + "SMOS <id8> <seq>".
 static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq, uint8_t sf, uint8_t mode) {
-    uint32_t now = ws_epoch_now();
+    uint32_t now = link_now();
     uint32_t min = now / 60;
     if (min != s_rx_min) { s_rx_min = min; s_rx_in_min = 0; }
     s_rx_total++;
@@ -775,7 +778,7 @@ static void beacon_code(char out[9], uint32_t minute) {
 
 // Nadanie beaconu. Zwraca airtime w ms (0 = nie nadano).
 static uint32_t link_tx_beacon(const LoraLinkCh& c) {
-    uint32_t now = ws_epoch_now();
+    uint32_t now = link_now();
     const int   bi  = band_for_freq(c.freq);
     const int8_t txp = REGIONS[s_region].smos_power;
     // Ramka niesie to, czego ODBIORNIK nie ma jak zmierzyc: moc nadawania (bez niej nie
@@ -870,7 +873,7 @@ bool lora_uplink_pending() { return s_up_pending; }
 // Nadanie JEDNEJ zaleglej ramki uplinku. Ta sama dyscyplina duty cycle co beacon.
 static void uplink_tx_next(const LoraLinkCh& c) {
     if (!s_up_pending) return;
-    uint32_t now = ws_epoch_now();
+    uint32_t now = link_now();
     const int    bi  = band_for_freq(c.freq);
     const int8_t txp = REGIONS[s_region].smos_power;
 
@@ -919,8 +922,20 @@ static void uplink_tx_next(const LoraLinkCh& c) {
 }
 
 // Jeden przebieg pętli link (~200 ms). Wszystko sterowane zegarem UTC — bez stanu między iteracjami.
-static void link_tick() {
+// Podstawa czasu dla harmonogramu link/beacon/uplink. ws_epoch_now() zna czas WYLACZNIE
+// z ramki identify, wiec node, ktory nigdy nie dokonczyl sesji WS (albo stracil ja przed
+// synchronizacja), ma epoch 0 — a wtedy link_tick wychodzil w pierwszej linii i tryb
+// awaryjny NIE NADAWAL NIC: ani beaconu, ani SMOSB, ani mesha. Potwierdzone na T-Beamie.
+// NTP jest juz w firmwarze i chodzi niezaleznie od WS, wiec sluzy jako zapas. Kolejnosc
+// jest istotna: online nadal rzadzi epoch z BE, zachowanie sieciowe sie nie zmienia.
+static uint32_t link_now() {
     uint32_t now = ws_epoch_now();
+    if (now) return now;
+    return ntp_synced() ? ntp_unix_time() : 0;
+}
+
+static void link_tick() {
+    uint32_t now = link_now();
     if (!now || !s_link.n_ch) { delay(200); return; }
 
     const uint8_t idx = (uint8_t)((now / 60 / s_link.min_per_ch) % s_link.n_ch);
@@ -1033,7 +1048,10 @@ static void link_tick() {
     // Slot nadawania: sekunda 10 + k*7 w każdej minucie. Trafiamy w nią raz — seq rośnie,
     // więc podwójne wejście w tę samą sekundę wykluczamy znacznikiem ostatniej minuty.
     static uint32_t last_tx_min = 0;
-    const uint32_t my_sec = LORA_LINK_SLOT0_S + (uint32_t)s_link.slot * LORA_LINK_SLOT_GAP_S;
+    // Slot z BE bywa wiekszy niz liczba slotow, ktore miesza sie w minucie (widziany 7).
+    // Bez zawiniecia my_sec ladowal na 59 s i okno uplinku (my_sec, 60-GUARD) bylo puste.
+    const uint8_t  slot_eff = (uint8_t)(s_link.slot % LORA_LINK_SLOTS);
+    const uint32_t my_sec = LORA_LINK_SLOT0_S + (uint32_t)slot_eff * LORA_LINK_SLOT_GAP_S;
     if (tx_ok && s_link.beacon && sec_in_min == my_sec && (now / 60) != last_tx_min &&
         (s_link.beacon_s == 0 || (now % s_link.beacon_s) < 60)) {
         last_tx_min = now / 60;
@@ -1259,7 +1277,7 @@ bool lora_link_on() { return s_link.on; }
 
 void lora_link_status_json(String& out) {
     char b[360];
-    uint32_t now = ws_epoch_now();
+    uint32_t now = link_now();
     snprintf(b, sizeof(b),
         "{\"on\":%s,\"beacon\":%s,\"slot\":%u,\"ch\":%d,\"n_ch\":%u,\"tx_seq\":%lu,"
         "\"rx_total\":%lu,\"rx_dropped\":%lu,\"region\":\"%s\",\"fallback\":%s,"
